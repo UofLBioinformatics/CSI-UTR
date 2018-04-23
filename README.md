@@ -1,3 +1,4 @@
+<center><img src="http://bioinformatics.louisville.edu/lab/localresources/images/CSIUTRHDR.png"/></center>
 # CSI-UTR
 A pipeline for detecting differential expression of 3-prime UTRs
 

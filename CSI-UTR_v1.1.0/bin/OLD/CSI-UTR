@@ -1,0 +1,3007 @@
+#!/usr/bin/perl -w
+use strict;
+use List::MoreUtils qw/ uniq /;
+use Getopt::Long;
+use MIME::Base64;
+use Statistics::TTest;  ## For T-Test
+use Text::NSP::Measures::2D::Fisher::twotailed; ## For Fisher Exact Text
+use Statistics::Multtest; ## For B-H FDR Correction
+use File::Which;
+
+##############################################################################
+## CSI-UTR                                                                  ##
+## Authors: Benjamin J. Harrison and Eric C. Rouchka                        ##
+##         Kentucky Biomedical Research Infrastructure Network (KBRIN)      ##
+##         Bioinformatics Core                                              ##
+## Modified: 5/16/2017                                                      ##
+## (c) 2015-2017, University of Louisville                                  ##
+## Description:                                                             ##
+## Cite: Harrison BJ, Park JW, Gomes C, Petruska JC, Sapio MR, Iadarola MJ, ##
+##       Rouchka EC. (2017) Detection of significantly differentially       ##
+##       expressed cleavage site intervals within 3' untranslated regions   ##
+##       using CSI-UTR.  Under review.                                      ##
+##                                                                          ##
+##    This program is free software: you can redistribute it and/or modify  ##
+##    it under the terms of the GNU General Public License as published by  ##
+##    the Free Software Foundation, either version 3 of the License, or     ##
+##    (at your option) any later version.                                   ##
+##                                                                          ##
+##    This program is distributed in the hope that it will be useful,       ##
+##    but WITHOUT ANY WARRANTY; without even the implied warranty of        ##
+##    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the         ##
+##    GNU General Public License for more details.                          ##
+##                                                                          ##
+##    You should have received a copy of the GNU General Public License     ##
+##    along with this program.  If not, see <http://www.gnu.org/licenses/>. ##
+##                                                                          ##
+##############################################################################
+
+##============== VERSION HISTORY =================##
+## 0.0.1: Initial Release
+## 0.0.2: Changed Normalization routine
+## 0.0.3: Added steps for collating contiguous UTRs
+##        Organized output into subdirectories
+## 0.0.4: Added in alternate polyadenylation routines
+## 0.0.5: Added in additional APA routines
+##        Added perl pod documentation
+##        Added additional comments
+## 0.0.6: Added Fisher's exact test for determining
+##        differential expression of CSIs within a UTR
+##        Added Benjamini-Hochberg FDR Correction Values
+##        Added Pvalue and FDR cutoffs for significance
+##        Added additional comments
+## 0.0.7  Added additional comments and GPL information
+## 1.0.0  Inital Public Release
+## 1.0.1  Fixed bug with rn6 now Rn6
+## 1.0.2  Added function to estimateSizeFactors (same as DESeq, DESeq2, DEXSeq)
+## 1.1.0  Added DEXSeq statistics for differential CSI usage (similar to differential exon usage)
+##        Fixed checkDependencies for samtools and bedtools
+##        Fixed issue for bedtools 2.24 for finding overlapping bed and bam features
+##        Removed the requirement of the number of mapped reads in sampleInformation.txt
+
+      ##################################
+      ## STRUCTURE OF .CSIusage files ##
+      ## 0: chr                       ##
+      ## 1: start                     ##
+      ## 2: end                       ##
+      ## 3: CSI ID                    ##
+      ## 4: score(unused)             ##
+      ## 5: strand                    ##
+      ## 6: numReads                  ##
+      ## 7: basesCovered              ##
+      ## 8: CSILength                 ##
+      ## 9: percentCovered            ##
+      ## 10: usage                    ##
+      ## 11: normUsage                ##
+      ## 12: geneID                   ##
+      ## 13: geneSymbol               ##
+      ##################################
+
+######################
+## GLOBAL VARIABLES ##
+######################
+my $VERSION       = "1.1.0";
+my $READ_LEN       = 75;
+my $GENOME         = "Rn6";
+my $SAMPLE_INFO_FN = "sampleInformation.txt";
+my $ORG_BED_FN     = "./data/locations/Rn6.CSIs.bed";
+my $ORG_ANNOT_FN   = "./data/annotations/Rn6.CSIs.annot.bed";
+my $OUT_DIR        = "CSI_OUT";
+my $DATA_DIR       = "./";
+my $SEPARATOR      = "///";
+my $SEPARATOR2     = "<=>";
+my $COVERAGE_CUT   = 0.8;
+my $USAGE_CUT      = 1.0;
+my $PVAL_CUTOFF    = 0.05;
+my $FDR_CUTOFF     = 0.10;
+my $OVERHANG;
+
+######################
+## FUNCTION LISTING ##
+######################
+# calc_mean
+# calculateInternal3utrusage_APA
+# calculateNormalizedTrackingValues
+# calculateReplicateAPAData
+# calculateSampleVariance
+# calculateTTestStatistics
+# checkAnnotFile
+# checkArraySize
+# checkBedFile
+# checkOptions
+# checkSampleFile
+# contrastHeader
+# countNonZero
+# createDataTableHash
+# createDEGFiles 
+# createDEXSeqFiles
+# createGroupHash
+# createNormalizedFiles
+# estimatePerMillionSizeFactors
+# estimateSizeFactors
+# filterContiguousCSIs
+# filternonContiguousCSIs
+# getAlternateAnnotations
+# getAnnotHash
+# getCompleteAnnotations
+# getCompStats 
+# getContiguousDirectories
+# getCoverageBed
+# getCutoffCSIs
+# getDataHash
+# getIDandSymbolAnnotations
+# getPositionHASH
+# getSampleArrInformaton
+# getStopID
+# makeDirectory
+# pairwiseComparisons
+# pairwiseDEXSeqComparisons
+# printContiguousInformation
+# printContiguousStatsFile
+# printExpressionMatrix
+# printMaxUTRInformation
+# printReplicateData
+# printUsage
+# testArraySizes
+# validateGenome
+
+
+#-----------------------------------------------------------------------------------
+sub validateGenome {
+   my ($genome) = @_;
+
+   #################################################  
+   ## Checks to make sure that the genome used is ##
+   ## a valid genome                              ##
+   ##---------------------------------------------##
+   ## INPUT : $genome (genome string)             ##
+   ## OUTPUT: $retVal (error message)             ##
+   #################################################
+  
+   my $retVal = "";
+#   if(!(($genome eq "Hg19") || ($genome eq "Hg38") || ($genome eq "Hg38-noAlt") ||
+#      ($genome eq "Mm10") || ($genome eq "Rn6"))) { 
+   if(!(($genome eq "Hg38") || ($genome eq "Rn6_extended") || 
+      ($genome eq "Mm10") || ($genome eq "Rn6"))) { 
+      $retVal = "INVALID GENOME: $genome ";
+      $retVal .= "(only Hg38, Mm10, Rn6, Rn6_extended are allowed)\n";
+   }
+   return($retVal);
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub checkOptions {
+   my($genome, $rLen, $inDir, $outDir) = @_;
+
+   #########################################################
+   ## Parses the input options to check to make sure that ##
+   ## they each are within a valid range                  ##
+   ##-----------------------------------------------------##
+   ## INPUT:  $genome (Hg19, Hg38, Hg38-noAlt, Mm10, Rn6) ##
+   ##         $rLen   (read length)                       ##
+   ##         $inDir  (input directory)                   ##
+   ##         $outDir (output directory)                  ##
+   ## OUTPUT: NONE                                        ##
+   #########################################################
+
+   my $errVal = 0;
+   my $errMSG="";
+   if($rLen < 0) { 
+      $errVal += 1; 
+      $errMSG .= "Invalid read length $rLen: Must be greater than 0.\n";
+   }
+   my $genomeMsg = validateGenome($genome);
+   if($genomeMsg ne "") {
+      $errVal += 1;
+      $errMSG .= $genomeMsg;
+   } 
+   if(!(-d $inDir)) { 
+      $errVal += 2;
+      $errMSG .= "Input directory $inDir does not exist.\n";
+   }
+   if($errVal > 0) { 
+      print "Error in checkOptions: Returned value of $errVal\nERRORS:\n$errMSG\n";
+      printUsage();
+      die("EXITING\n");
+   }
+   print "PASSED: COMMAND LINE OPTIONS VALIDATED\n";
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub checkAnnotFile {
+   my($genome) = @_;
+
+   #########################################################
+   ## Checks that the annotation file exists as well      ##
+   ## as whether or not it is formulated correctly        ##
+   ##-----------------------------------------------------##
+   ## INPUT:  $genome (Hg19, Hg38, Hg38-noAlt, Mm10, Rn6) ##
+   ## OUTPUT: $annotFN (annotation file name)             ##
+   #########################################################
+   
+   my $annotFN = "./data/annotations/$genome.CSIs.annot.bed";
+   if(!(-e $annotFN)) { 
+      die("ERROR IN ANNOTATION FILE: $annotFN DOES NOT EXIST");
+   }
+   open(INFILE, $annotFN) || die("ERROR IN checkAnnotFile: Cannot open $annotFN");
+   while(defined(my $line = <INFILE>)) { 
+      chomp($line);
+      my @wds = split(/\t/, $line);
+      my $numFields = @wds;
+      if(($numFields > 8) || ($numFields < 7)) {
+         die("ERROR IN ANNOTATION FILE AT LINE $line: EXPECTED 8 FIELDS; FOUND $numFields");
+      }
+   }
+   close(INFILE);
+   print "PASSED: GENOME ANNOTATION FILE EXISTS\n";
+   return($annotFN); 
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub checkBedFile {
+   my($genome) = @_;
+
+   ##########################################################
+   ## Checks to see if the bed file for the current genome ##
+   ## exists and whether or not it is formulated correctly ##
+   ##------------------------------------------------------##
+   ## INPUT:  $genome (Hg19, Hg38, Hg38-noAlt, Mm10, Rn6)  ##
+   ## OUTPUT: $bedFN (bed file name)                       ##
+   ##########################################################
+   
+   my $bedFN = "./data/locations/$genome.CSIs.bed";
+   if(!(-e $bedFN)) { 
+      die("ERROR IN BED FILE: $bedFN DOES NOT EXIST");
+   }
+   open(INFILE, $bedFN) || die("ERROR IN checkBedFile: Cannot open $bedFN");
+   while(defined(my $line = <INFILE>)) { 
+      chomp($line);
+      my @wds = split(/\t/, $line);
+      my $numFields = @wds;
+      if($numFields != 6) {
+         die("ERROR IN BED FILE AT LINE $line: EXPECTED 6 FIELDS; FOUND $numFields");
+      }
+   }
+   close(INFILE);
+   print "PASSED: GENOME BED FILE EXISTS\n";
+   return($bedFN); 
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub printUsage {
+
+   ################################################
+   ## This function prints the usage information ##
+   ##--------------------------------------------##
+   ## INPUT:  NONE                               ##
+   ## OUTPUT: NONE                               ##
+   ################################################
+print <<EOT
++++++++++++++++++
+CSI-UTR v$VERSION
++++++++++++++++++
+
+Please Cite: Harrison BJ, Park JW, Gomes C, Petruska JC, Sapio MR, Iadarola MJ, 
+             Rouchka EC. (2017) Detection of significantly differentially       
+             expressed cleavage site intervals within 3' untranslated regions   
+             using CSI-UTR.  Under review.                                      
+(C) 2015-2017, University of Louisville.  All Rights Reserved.
+
+================================================
+USAGE: CSI-UTR <options>
+------------------------------------------------
+   options: 
+      -genome=<genome>                    (default: Rn6)
+      -r=<read_length>                    (default: 75)
+      -sample_info=<sample_info_table_fn> (default: sampleInformaton.txt) 
+      -bed=<CSI_bed_file>                 (default: ./data/locations/Rn6.CSIs.bed)
+      -annot=<CSI_annotation_file>        (default: ./data/annotations/Rn6.CSIs.annot.bed)
+      -out=<output directory>             (default: ./CSI_OUT/) 
+      -data_dir=<input directory>         (default: ./) 
+      -coverage_cut=<coverage cutoff>     (default: 0.08) 
+      -usage_cut=<usage cutoff>           (default: 1.0)
+
+      --h Print this help screen
+      --v Print version information
+================================================
+
+EOT
+
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub makeDirectory {
+   my ($dir) = @_;
+
+   ###########################################################
+   ## This subroutine checks to see if the directory exists ##
+   ## and if it does not, creates it                        ##
+   ##-------------------------------------------------------##
+   ## INPUT:  $dir (Directory Name to create)               ##
+   ## OUTPUT: NONE                                          ##
+   ###########################################################
+
+   if(!(-d $dir)) {
+      print "$dir Does not exist... creating\n";
+      my $cmd = "mkdir $dir";
+      system($cmd);
+   }
+   else {
+      print "$dir already exists\n";
+   }
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub getCoverageBed {
+   my($sampleArrREF, $csiBEDFN, $inDir, $outDir) = @_;
+
+   ###################################################################
+   ## Retrieves the bed file describing the CSIs and converts the   ##
+   ## bam alignment files for each sample to the CSIs using         ##
+   ## coverageBed                                                   ##
+   ##---------------------------------------------------------------##
+   ## INPUT:  $sampleArrREF (reference to sample array information) ##
+   ##         $csiBEDFN     (CSI bed file name)                     ##
+   ##         $inDir        (input directory)                       ##
+   ##         $outDir       (output directory)                      ##
+   ## OUTPUT: NONE                                                  ##
+   ###################################################################
+
+   my @sampleArr = @$sampleArrREF;
+   my $numSamples = @sampleArr;
+ 
+   if(!(-e $csiBEDFN)) { 
+      die("ERROR in getCoverageBed: Bed File $csiBEDFN does not exist");
+   }
+   makeDirectory($outDir);
+   my $coverageDIR = $outDir . "/COVERAGE/";
+   makeDirectory($coverageDIR);
+
+   my $numCreated=0;
+   my $numSkipped=0;
+
+   for(my $i = 0; $i < $numSamples; $i++) { 
+      my $currBamFN = $inDir . "/" . $sampleArr[$i] . ".bam";
+      my $currCSIFN = $outDir . "/COVERAGE/" . $sampleArr[$i] . ".CSIcoverage";
+
+      my $cmd = "multiBamCov -bams $currBamFN -bed $csiBEDFN > $currCSIFN";
+      if(-e($currCSIFN)) { 
+         print "NOTICE: getCoverageBed:  Skipping creation of the file ";
+         print "$currCSIFN since it already exists.\n";
+         $numSkipped++;
+      }
+      else { 
+         print "Running $cmd\n";
+         system($cmd);
+         $numCreated++;
+      }
+   }
+   print "PASSED: coverageBed OK. Created $numCreated .CSIcoverage ";
+   print "files.  Skipped $numSkipped.\n";
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub createDEXSeqFiles {
+   my($sampleArrREF, $inDir, $outDir) = @_;
+
+   ###################################################################
+   ## Retrieves the bed file describing the CSIs and converts the   ##
+   ## bam alignment files for each sample to the CSIs using         ##
+   ## coverageBed                                                   ##
+   ##---------------------------------------------------------------##
+   ## INPUT:  $sampleArrREF (reference to sample array information) ##
+   ##         $csiBEDFN     (CSI bed file name)                     ##
+   ##         $inDir        (input directory)                       ##
+   ##         $outDir       (output directory)                      ##
+   ## OUTPUT: NONE                                                  ##
+   ###################################################################
+
+   my @sampleArr = @$sampleArrREF;
+   my $numSamples = @sampleArr;
+ 
+   makeDirectory($outDir);
+   my $dexseqDIR = $outDir . "/DEXSeq/";
+   makeDirectory($dexseqDIR);
+   my $coverageDIR = $outDir . "/COVERAGE/";
+   my $EXON_CSI_FN = $dexseqDIR . "Exon_to_CSI.txt";
+   open(EXONCSIFILE, ">$EXON_CSI_FN") || die("Error opening $EXON_CSI_FN for writing");
+
+   for(my $i = 0; $i < $numSamples; $i++) { 
+      my $currBamFN = $inDir . "/" . $sampleArr[$i] . ".bam";
+      my $currCSIFN = $coverageDIR . $sampleArr[$i] . ".CSIcoverage";
+      my $currDEXFN = $dexseqDIR . $sampleArr[$i] . ".DEXSeq.counts";
+      my $currGFFFN = $dexseqDIR . $sampleArr[$i] . ".DEXSeq.gff";
+
+      open(INFILE, "$currCSIFN") || die("Error opening $currCSIFN for reading");
+      open(COUNTFILE, ">$currDEXFN") || die("Error opening $currDEXFN for reading");
+
+      my %exonNumHASH;
+      my %geneInfoHASH;
+      my %exonInfoHASH;
+
+      while(defined(my $line = <INFILE>)) { 
+         chomp($line);
+#         my($chr, $beg, $end, $CSI, $score, $strand, $overlapFeat, 
+#            $overlapBases, $CSILen, $pctCovered) = split(/\t/, $line);
+         my($chr, $beg, $end, $CSI, $score, $strand, $overlapFeat) = split(/\t/, $line);
+         my ($geneName, $rest) = split(/\:/, $CSI);
+         if($beg > $end) { 
+            my $tmp = $beg;
+            $beg = $end;
+            $end = $tmp; 
+         }
+         $beg++;
+         my $len = $end - $beg;
+         if($len > 0) { 
+            ## ONLY UPDATE NOW
+            if(!defined($exonNumHASH{$geneName})) { 
+               $exonNumHASH{$geneName} = 1;
+            }
+            else {
+               $exonNumHASH{$geneName}++;
+            }
+            my $exonNum = $exonNumHASH{$geneName};
+
+            #################################
+            ## UPDATE THE GENE INFORMATION ##
+            #################################
+            if(!defined($geneInfoHASH{$geneName})) { 
+               $geneInfoHASH{$geneName} =  "$chr\tdexseq_prepare_annotation.py\taggregate_gene\t$beg\t$end\t";
+               $geneInfoHASH{$geneName} .= ".\t$strand\t.\tgene_id \"$geneName\"\n";
+            }
+            else {
+               my $prevInfo = $geneInfoHASH{$geneName};
+               my @wds = split(/\t/, $prevInfo);
+               my $oBeg = $wds[3];
+               my $oEnd = $wds[4];
+               if($beg < $oBeg) { $wds[3] = $beg; }
+               if($end > $oEnd) { $wds[4] = $end; }
+               my $newInfo = join("\t", @wds);
+               $geneInfoHASH{$geneName} = $newInfo;
+            }
+            #################################
+            ## UPDATE THE EXON INFORMATION ##
+            #################################
+            my $exon = $exonNum;
+            if($exonNum < 100) { 
+               $exon = "0" . $exon;
+            }
+            if($exonNum < 10) { 
+               $exon = "0" . $exon; 
+            }   
+            print COUNTFILE "$geneName:$exon\t$overlapFeat\n";
+            if($i == 0) { ## ONLY WRITE THE FIRST TIME THROUGH
+               print EXONCSIFILE "$geneName:$exon\t$CSI\n";
+            }
+
+            my $currExonicInfo = "$chr\tdexseq_prepare_annotation.py\texonic_part\t$beg\t$end\t.\t";
+            $currExonicInfo .= "$strand\t.\ttranscripts \"$geneName";
+            $currExonicInfo .= "_$exonNum\"; exonic_part_number \"$exon\"; gene_id \"$geneName\"\n";
+            if(!defined($exonInfoHASH{$geneName})) { 
+               $exonInfoHASH{$geneName} = $currExonicInfo;
+            }
+            else {
+               $exonInfoHASH{$geneName} .= $currExonicInfo;
+            } 
+         }
+      }
+      close(INFILE);
+      close(COUNTFILE);
+      open(GFFFILE, ">$currGFFFN") || die("Error opening $currGFFFN for writing");
+      
+      my @k = sort(keys(%geneInfoHASH));
+      my $numK = @k;
+      for(my $kIndex = 0; $kIndex < $numK; $kIndex++) { 
+         my $currGeneInfo = $geneInfoHASH{$k[$kIndex]};
+         my $currExonInfo = $exonInfoHASH{$k[$kIndex]};
+         if(!defined($currGeneInfo)) { 
+            die("GENE INFORMATION NOT DEFINED FOR $k[$kIndex]\n");
+         }
+         if(!defined($currExonInfo)) { 
+            die("EXON INFORMATION NOT DEFINED FOR $k[$kIndex]\n");
+         }
+         print GFFFILE "$currGeneInfo$currExonInfo";
+      }
+      close(GFFFILE);
+   }
+   close(EXONCSIFILE);
+   print "PASSED: createDEXSeq OK\n";
+}
+#-----------------------------------------------------------------------------------
+
+
+#-----------------------------------------------------------------------------------
+sub checkSampleFile {
+   my($inDir, $sampleFN) = @_;
+
+   #####################################################################
+   ## Checks the sample description file and makes sure the bam files ##
+   ## for each sample exists, returning the sample file information   ##
+   ##-----------------------------------------------------------------##
+   ## INPUT:  $inDir    (input directory)                             ##
+   ##         $sampleFN (sample file name)                            ##
+   ## OUTPUT: @retArr   (array of sample information in config file)  ##
+   #####################################################################
+
+   my $inFN = $sampleFN;
+   my @retArr;
+
+   if(!(-e $inFN)) { 
+      die("Error in checkSampleFile: sample file $inFN does not exist");
+   }
+   open(INFILE, $inFN) || die("Error in checkSampleFile: cannot open $inFN for reading");
+   while(defined(my $line = <INFILE>)) { 
+      chomp($line);
+      my ($sampleID, $condition, $rep, $numMapped) = split(/\t/, $line);
+      my @currArr = ($sampleID, $condition, $rep, $numMapped);
+      my $currBAMfn = $inDir . "/" . $sampleID . ".bam";
+      if(!(-e $currBAMfn)) { 
+         die("Error in checkSampleFile: bam alignment file $currBAMfn does not exist for sample $sampleID");
+      }
+      my $currBAMindexfn = $currBAMfn . ".bai";
+      if(!(-e $currBAMindexfn)) { 
+         print "$currBAMfn not indexed ... sorting bam file\n";
+ 
+         my $cmd = "samtools sort $currBAMfn -T tmpSorted -o tmpSorted2.bam";
+         print "$cmd\n";
+         system($cmd);
+         $cmd = "mv tmpSorted2.bam $currBAMfn";
+         system($cmd);
+         print "$currBAMfn sorted\n";
+         $cmd = "samtools index $currBAMfn";
+         print "$cmd\n";
+         system($cmd);
+         print "$currBAMfn indexed\n";
+      }
+     
+      push(@retArr, $line);
+   }
+   close(INFILE);
+   my $len = @retArr;
+   
+   print "PASSED: Sample file OK\n";
+   return(@retArr); 
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub getSampleArrInformation {
+   my($sampleArrREF, $index) = @_;
+
+   #######################################################################
+   ## Returns the data sored in a particular index for the sample data. ##
+   ## Each line of the sample data is stored in an array with tab       ##
+   ## delimited values.                                                 ##
+   ##-------------------------------------------------------------------##
+   ## INPUT:  $sampleArrREF (Reference to sample array information)     ##
+   ##         $index        (position in sample array to print)         ##
+   ## OUTPUT: @retArr       (array containing information for each      ##
+   ##                        sample contained at the index position)    ##
+   #######################################################################
+  
+   my @sampleArr = @$sampleArrREF; 
+   my $len = @sampleArr;
+
+   my @retArr;
+   for(my $i = 0; $i < $len; $i++) { 
+      my $currLine = $sampleArr[$i];
+      my @wds = split(/\t/, $currLine);
+      my $numWds = @wds;
+      if($index >= $numWds) { 
+         die("Error in getSampleArrInformation: invalid index $index");
+      }
+      push(@retArr, $wds[$index]);
+   }
+   return(@retArr);
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub getAlternateAnnotations {
+   my($annFN) = @_;
+
+   ###########################################################################
+   ## Reads in the annotation file which contains information including the ##
+   ## ENSEMBL gene ID (accession) and  gene symbol corresponding to each    ##
+   ## CSI.  An annotation hash is returned, with the CSI stop id as the key ##
+   ## and the complete annotation array as the value with the following     ##
+   ## indices:                                                              ##
+   ## INDEX 0: chomosome                                                    ##
+   ##       1: CSI begin                                                    ##
+   ##       2: CSI end                                                      ##
+   ##       3: CSI ID                                                       ##
+   ##       4: 1                                                            ##
+   ##       5: strand (+/-)                                                 ##
+   ##       6: ENSEMBL gene ID                                              ##
+   ##       7: Gene Symbol                                                  ##
+   ##-----------------------------------------------------------------------##
+   ## INPUT:  $annFN   (Annotation file name)                               ##
+   ## OUTPUT: %altHash (Hash with CSI stop id as the key and complete       ##
+   ##                   annotation as the value)                            ##
+   ###########################################################################
+
+   my %altHash;
+   open(ANNOTFILE, $annFN) || 
+      die("Error in getAlternateAnnotations: Cannot open $annFN for reading");
+   my $totCnt = 0;
+   while(defined(my $line = <ANNOTFILE>)) { 
+      chomp $line;
+      my @clms = split(/\t/, $line);
+      my $csiID = $clms[3];
+   
+      ###################################################### 
+      ## CSI ID FORMAT: ENSEMBLgene:CSIstop_CSIbeg-CSIend ##
+      ## stopID FORMAT: ENSEMBLgene:CSIstop               ##
+      ###################################################### 
+      if($csiID =~ /(.*):(\d+)_(\d+)\-(\d+)/){
+         my $stopID = $1.":".$2;
+         $altHash{$stopID} = "$line";
+         $totCnt++;
+      }
+   }
+   close(ANNOTFILE);
+   print "PASSED: AlternateAnnotation information retrieved OK\n";
+   return(%altHash);
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub getIDandSymbolAnnotations {
+   my($annFN) = @_;
+
+   ###########################################################################
+   ## Reads in the annotation file which contains information including the ##
+   ## ENSEMBL gene ID (accession) and  gene symbol corresponding to each    ##
+   ## CSI.  An annotation hash is returned, with the CSI id as the key      ##
+   ## and the ENSEMBLID and gene symbol as the value.  Each annotation line ##
+   ## has the following indices:                                            ##
+   ## INDEX 0: chomosome                                                    ##
+   ##       1: CSI begin                                                    ##
+   ##       2: CSI end                                                      ##
+   ##       3: CSI ID                                                       ##
+   ##       4: 1                                                            ##
+   ##       5: strand (+/-)                                                 ##
+   ##       6: ENSEMBL gene ID                                              ##
+   ##       7: Gene Symbol                                                  ##
+   ##-----------------------------------------------------------------------##
+   ## INPUT:  $annFN (Annotation file name)                                 ##
+   ## OUTPUT: %aHash (Hash with CSI id as the key and ENSEMBLID and gene    ##
+   ##                 symbol as the value)                                  ##
+   ###########################################################################
+
+   my %aHash;
+   open(ANNOTFILE, $annFN) || die("Error in getIDandSymbolAnnotations: Cannot open $annFN for reading");
+   while(defined(my $line = <ANNOTFILE>)) { 
+      chomp $line;
+      my @clms = split(/\t/, $line);
+      my $currCSI = $clms[3];
+      my $accession = "";
+      if(exists $clms[6]){
+         $accession = $clms[6];
+      }
+      my $symbol = "";
+      if(exists $clms[7]){
+         $symbol = $clms[7];
+      }
+      my $annotation = "$accession\t$symbol";
+      $aHash{$currCSI} = "$annotation";
+   }
+   close(ANNOTFILE);
+   print "PASSED: Annotation information retrieved OK\n";
+   return(%aHash);
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub getCompleteAnnotations {
+   my($annFN) = @_;
+
+   ###########################################################################
+   ## Reads in the annotation file which contains information including the ##
+   ## ENSEMBL gene ID (accession) and  gene symbol corresponding to each    ##
+   ## CSI.  An annotation hash is returned, with the CSI id as the key      ##
+   ## and the value as the complete annotation line with the following      ##
+   ## indices:                                                              ##
+   ## INDEX 0: chomosome                                                    ##
+   ##       1: CSI begin                                                    ##
+   ##       2: CSI end                                                      ##
+   ##       3: CSI ID                                                       ##
+   ##       4: 1                                                            ##
+   ##       5: strand (+/-)                                                 ##
+   ##       6: ENSEMBL gene ID                                              ##
+   ##       7: Gene Symbol                                                  ##
+   ##-----------------------------------------------------------------------##
+   ## INPUT:  $annFN (Annotation file name)                                 ##
+   ## OUTPUT: %aHash (Hash with CSI id as the key and the complete          ##
+   ##                 annotation as the value)                              ##
+   ###########################################################################
+
+   my %aHash;
+   open(ANNOTFILE, $annFN) || die("Error in getCompleteAnnotations: Cannot open $annFN for reading");
+   while(defined(my $line = <ANNOTFILE>)) { 
+      chomp $line;
+      my @clms = split(/\t/, $line);
+      $aHash{$clms[3]} = $line;
+   }
+   close(ANNOTFILE);
+   print "PASSED: Annotation information retrieved OK\n";
+   return(%aHash);
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub estimatePerMillionSizeFactors {
+   my($oDIR, $sNameREF, $sCondREF, $sRepREF, $readlength, $overhang) = @_;
+
+   ###########################################################################
+   ## Normalizes the read counts for each sample and writes the normalized  ##
+   ## values to the file NormalizationTracking.txt                          ##
+   ##-----------------------------------------------------------------------##
+   ## INPUT:  $oDIR       (output directory)                                ##
+   ##         $sNameREF   (reference to sample name array)                  ##
+   ##         $sCondREF   (reference to sample condition array)             ##
+   ##         $sRepREF    (reference to sample replicate array)             ##
+   ##         $readLength (length of sequencing reads)                      ##
+   ##         $overhang   (length of potential overhang in overlapping reads##
+   ## OUTPUT: @sampleInfo (sample information array with normalization      ##
+   ##                      factor added)                                    ##
+   ##=======================================================================##
+   ## TODO: SHOUWLD ADD IN ADDITIONAL NORMALIATION FACTORS SUCH AS MAX,     ##
+   ##       MIN, MILLION, MEAN                                              ##
+   ###########################################################################
+
+   my @sampleNameArr = @$sNameREF;
+   my @sampleCondArr = @$sCondREF;
+   my @sampleRepArr  = @$sRepREF;
+
+   my $numSamples = @sampleNameArr;
+
+   my @normFactorARR;
+   for(my $i = 0; $i < $numSamples; $i++) {
+
+      my $file = $sampleNameArr[$i];
+      my $coverageFN = $oDIR . "/COVERAGE/" . $file . ".CSIcoverage";
+
+      open(COVERAGE, $coverageFN) || 
+         die("Error in estimatePerMillionSizeFactors: cannot open $coverageFN for reading");
+      my $usageSum = 0;
+      while (my $line = <COVERAGE>){
+         chomp $line;
+
+         my($chr, $beg, $end, $CSI, $score, $strand, $numReads) = split(/\t/, $line);
+         if($beg > $end) { 
+            my $tmp = $beg;
+            $beg = $end;
+            $end = $tmp;
+        }
+         my $csiLength = $end - $beg + 1;
+
+         my $currUsage=0;
+         my $normUsage;
+         if($numReads > 0){
+            ## TODO: Test overhangs to make sure they are correct ##
+            $currUsage = (($numReads*$readlength)/($csiLength+$overhang));
+            $usageSum += $currUsage;
+         }
+      }
+
+      ## Calculate normalization factor as counts per million - CPM ##
+      my $normFactor2 = 1000000 / $usageSum;
+      push(@normFactorARR, $normFactor2);
+      close(COVERAGE);
+   }
+   print "PASSED: Per Million Size Factor Calculated\n";
+   return(@normFactorARR);
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub calculateNormalizedTrackingValues {
+   my($oDIR, $sNameREF, $sCondREF, $sRepREF, $readlength, $overhang, $sizeREF) = @_;
+
+   ###########################################################################
+   ## Normalizes the read counts for each sample and writes the normalized  ##
+   ## values to the file NormalizationTracking.txt                          ##
+   ##-----------------------------------------------------------------------##
+   ## INPUT:  $oDIR       (output directory)                                ##
+   ##         $sNameREF   (reference to sample name array)                  ##
+   ##         $sCondREF   (reference to sample condition array)             ##
+   ##         $sRepREF    (reference to sample replicate array)             ##
+   ##         $readArrREF (reference to read array)                         ##
+   ##         $readLength (length of sequencing reads)                      ##
+   ##         $overhang   (length of potential overhang in overlapping reads##
+   ## OUTPUT: @sampleInfo (sample information array with normalization      ##
+   ##                      factor added)                                    ##
+   ##=======================================================================##
+   ## TODO: SHOUWLD ADD IN ADDITIONAL NORMALIATION FACTORS SUCH AS MAX,     ##
+   ##       MIN, MILLION, MEAN                                              ##
+   ###########################################################################
+
+   my @sampleNameArr = @$sNameREF;
+   my @sampleCondArr = @$sCondREF;
+   my @sampleRepArr  = @$sRepREF;
+   my @sizeFactors   = @$sizeREF; ## SIZE FACTORS ##
+
+   my $normFN = ">" . $oDIR . "/NormalizationTracking.txt";
+   open (NORMFILE, $normFN) || 
+      die("Error in calculateNormalizedTrackingValues: Cannot open $normFN for writing");
+
+   my $numSamples = @sampleNameArr;
+
+   my @normFactorARR;
+   
+   my @sampleInfo;
+   for(my $i = 0; $i < $numSamples; $i++) { 
+      my $normFactor = $sizeFactors[$i];
+
+      my $newSampleInfo = "$sampleNameArr[$i]\t$sampleCondArr[$i]\t";
+      $newSampleInfo .= "$sampleRepArr[$i]\t$normFactor";
+      push (@sampleInfo, $newSampleInfo);
+      print NORMFILE "$newSampleInfo\n";
+   }
+   close(NORMFILE);  
+   print "PASSED: Normalized Tracking Values Calculated\n";
+   return(@sampleInfo);
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub estimateSizeFactors {
+   my($oDIR, $sNameREF, $sCondREF, $sRepREF, $readlength, $overhang) = @_;
+
+   ###########################################################################
+   ## estimates size factors using median of the ratios of observed counts  ##
+   ## as done in DESeq, DESeq2, DEXSeq                                      ##
+   ##-----------------------------------------------------------------------##
+   ## INPUT:  $oDIR       (output directory)                                ##
+   ##         $sNameREF   (reference to sample name array)                  ##
+   ##         $sCondREF   (reference to sample condition array)             ##
+   ##         $sRepREF    (reference to sample replicate array)             ##
+   ##         $readArrREF (reference to read array)                         ##
+   ##         $readLength (length of sequencing reads)                      ##
+   ##         $overhang   (length of potential overhang in overlapping reads##
+   ## OUTPUT: @sampleInfo (sample information array with normalization      ##
+   ##                      factor added)                                    ##
+   ##=======================================================================##
+   ## TODO: SHOUWLD ADD IN ADDITIONAL NORMALIATION FACTORS SUCH AS MAX,     ##
+   ##       MIN, MILLION, MEAN                                              ##
+   ###########################################################################
+
+   my @sampleNameArr = @$sNameREF;
+   my @sampleCondArr = @$sCondREF;
+   my @sampleRepArr  = @$sRepREF;
+   my @sizeFactors;
+
+   my $numSamples = @sampleNameArr;
+
+   my @ArrayOfCountHashes;
+
+   ## First, read in the array of counts -- this will then be used to
+   ## estimate median of ratios of observed counts
+   for(my $i = 0; $i < $numSamples; $i++) {
+      my $currCntHashREF; 
+
+      my $file = $sampleNameArr[$i];
+      my $coverageFN = $oDIR . "/COVERAGE/" . $file . ".CSIcoverage";
+
+      open(COVERAGE, $coverageFN) || 
+         die("Error in estimateSizeFactors: cannot open $coverageFN for reading");
+      my $usageSum = 0;
+
+      while (my $line = <COVERAGE>){
+         chomp $line;
+         my($chr, $beg, $end, $currCSI, $score, $strand, $numReads) = split(/\t/, $line);
+         $currCntHashREF->{$currCSI} = $numReads;
+      }
+      push(@ArrayOfCountHashes, $currCntHashREF);
+      close(COVERAGE);
+   }
+   my @CSI_Arr = sort(keys %{$ArrayOfCountHashes[0]});
+   my $numCSIs = @CSI_Arr;
+
+   for(my $i = 0; $i < $numSamples; $i++) { 
+      ## FIND SIZE FACTOR FOR SAMPLE $i
+      my @ratioArr; 
+      for(my $j = 0; $j < $numCSIs; $j++) { 
+         my $product = 1;
+         for(my $v = 0; $v < $numSamples; $v++) { 
+            my $currCnt = $ArrayOfCountHashes[$v]->{$CSI_Arr[$j]};
+            if($currCnt > 0) { 
+               $product *= $ArrayOfCountHashes[$v]->{$CSI_Arr[$j]};
+            }
+         }
+         my $num = $ArrayOfCountHashes[$i]->{$CSI_Arr[$j]};
+         my $denom = $product ** (1/$numSamples);
+         my $currRatio = $num / $denom;
+         push(@ratioArr, $currRatio);
+      }
+      my @sortRatio = sort(@ratioArr);
+      my $medianIndex = int($numCSIs / 2);
+      my $currSizeFactor = $sortRatio[$medianIndex];
+      push(@sizeFactors, $currSizeFactor);
+      print "SAMPLE $i SIZE FACTOR: $currSizeFactor\n"; 
+   }
+   print "PASSED: Size Factors Calculated OK\n";
+   return(@sizeFactors);
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub calculateSampleVariance {
+   my($oDIR, $sNameREF, $sCondREF, $sRepREF, 
+      $readArrREF, $readlength, $overhang) = @_;
+
+   ###########################################################################
+   ## calculates sample variance                                            ##
+   ##-----------------------------------------------------------------------##
+   ## INPUT:  $oDIR       (output directory)                                ##
+   ##         $sNameREF   (reference to sample name array)                  ##
+   ##         $sCondREF   (reference to sample condition array)             ##
+   ##         $sRepREF    (reference to sample replicate array)             ##
+   ##         $readArrREF (reference to read array)                         ##
+   ##         $readLength (length of sequencing reads)                      ##
+   ##         $overhang   (length of potential overhang in overlapping reads##
+   ## OUTPUT: @sampleInfo (sample information array with normalization      ##
+   ##                      factor added)                                    ##
+   ##=======================================================================##
+   ## TODO: SHOUWLD ADD IN ADDITIONAL NORMALIATION FACTORS SUCH AS MAX,     ##
+   ##       MIN, MILLION, MEAN                                              ##
+   ###########################################################################
+
+   my @reads = @$readArrREF; 
+   my @sampleNameArr = @$sNameREF;
+   my @sampleCondArr = @$sCondREF;
+   my @sampleRepArr  = @$sRepREF;
+   my @sizeFactors;
+
+   my $totalReads = 0;
+   my $numSamples = @reads;
+
+   my @ArrayOfCountHashes;
+   
+   my @meanArr;
+   my @numCSIArr;
+   my @varianceArr;
+
+   ## First, read in the array of counts -- this will then be used to
+   ## Calculate the mean value for calculation of variance
+   for(my $i = 0; $i < $numSamples; $i++) {
+      $totalReads += $reads[$i];
+      my $currCntHashREF; 
+
+      my $file = $sampleNameArr[$i];
+      my $coverageFN = $oDIR . "/COVERAGE/" . $file . ".CSIcoverage";
+
+      open(COVERAGE, $coverageFN) || 
+         die("Error in calculateNormalizedTrackingValues: cannot open $coverageFN for reading");
+      my $usageSum = 0;
+
+      my $totNumReads = 0;
+      my $numCSIs = 0;
+      while (my $line = <COVERAGE>){
+         chomp $line;
+         my($chr, $beg, $end, $currCSI, $score, $strand, $numReads) = split(/\t/, $line);
+         $currCntHashREF->{$currCSI} = $numReads;
+         $totNumReads += $numReads;
+         $numCSIs++;
+      }
+      push(@ArrayOfCountHashes, $currCntHashREF);
+      close(COVERAGE);
+      my $currMean = 0;
+      if($numCSIs > 0) { 
+         $currMean = $totNumReads / $numCSIs;
+      }
+      push(@meanArr, $currMean);
+      push(@numCSIArr, $numCSIs);
+
+      print "SAMPLE $i $sampleNameArr[$i] has a total of $totNumReads reads in $numCSIs CSIs for a mean of $currMean\n";
+   }
+
+   ##############################################
+   ## NOW GO BACK THROUGH TO ESTIMATE VARIANCE ##
+   ##############################################
+   for(my $i = 0; $i < $numSamples; $i++) {
+      my $file = $sampleNameArr[$i];
+      my $currMean = $meanArr[$i];
+      my $denominator = $numCSIArr[$i];
+      my $numerator = 0;
+      my $coverageFN = $oDIR . "/COVERAGE/" . $file . ".CSIcoverage";
+
+      open(COVERAGE, $coverageFN) || 
+         die("Error in calculateNormalizedTrackingValues: cannot open $coverageFN for reading");
+
+      while (my $line = <COVERAGE>){
+         chomp $line;
+         my @clms = split(/\t/, $line);
+         my($chr, $beg, $end, $CSI, $score, $strand, $numReads) = split(/\t/, $line);
+         $numerator += ($numReads - $currMean) ** 2;
+      }
+      close(COVERAGE);
+      my $currVariance = $numerator / $denominator;
+
+      push(@varianceArr, $currVariance);
+      print "SAMPLE $i $sampleNameArr[$i] has a variance of $currVariance\n";
+   }
+
+   my @CSI_Arr = sort(keys %{$ArrayOfCountHashes[0]});
+   my $numCSIs = @CSI_Arr;
+
+   for(my $i = 0; $i < $numSamples; $i++) { 
+      ## FIND SIZE FACTOR FOR SAMPLE $i
+      my @ratioArr; 
+      for(my $j = 0; $j < $numCSIs; $j++) { 
+         my $product = 1;
+         for(my $v = 0; $v < $numSamples; $v++) { 
+            my $currCnt = $ArrayOfCountHashes[$v]->{$CSI_Arr[$j]};
+            if($currCnt > 0) { 
+               $product *= $ArrayOfCountHashes[$v]->{$CSI_Arr[$j]};
+            }
+         }
+         my $num = $ArrayOfCountHashes[$i]->{$CSI_Arr[$j]};
+         my $denom = $product ** (1/$numSamples);
+         my $currRatio = $num / $denom;
+         push(@ratioArr, $currRatio);
+      }
+      my @sortRatio = sort(@ratioArr);
+      my $medianIndex = int($numCSIs / 2);
+      my $currSizeFactor = $sortRatio[$medianIndex];
+      push(@sizeFactors, $currSizeFactor);
+      print "SAMPLE $i SIZE FACTOR: $currSizeFactor\n"; 
+   }
+   return(@sizeFactors);
+}
+#-----------------------------------------------------------------------------------
+
+
+#-----------------------------------------------------------------------------------
+sub createNormalizedFiles {
+
+   my($oDIR, $sInfoREF, $aHashREF, $readlength, $overhang) = @_;
+
+   ################################################################################
+   ## Calculates normalized CSI usage for each sample based on the normalization ##
+   ## factor and also creates a bed file which can be read into the genome       ##
+   ## browser as a track                                                         ##
+   ## Sample Information:                                                        ##
+   ##    Index 0: File                                                           ##
+   ##          1: Condition                                                      ##
+   ##          2: replicate                                                      ##
+   ##          3: Normalization factor                                           ##
+   ##----------------------------------------------------------------------------##
+   ## INPUT:  $oDIR       (output directory)                                     ##
+   ##         $sInfoREF   (reference to sample information array)                ##
+   ##         $aHashREF   (reference to anntoation hash)                         ##
+   ##         $readlength (sequencing read length)                               ##
+   ##         $overhang   (potential overhang between adjacent reads)            ##
+   ## OUTPUT: NONE                                                               ##
+   ################################################################################
+
+   my @sampleInfo = @$sInfoREF;
+   my %annotationHASH = %$aHashREF;
+   my $usageDIR = $oDIR . "/USAGE/";
+   my $bedDIR = $oDIR . "/BED/";
+   makeDirectory($usageDIR);
+   makeDirectory($bedDIR);
+
+   foreach my $line (@sampleInfo){
+      my @clms = split(/\t/, $line);
+      my $file = $clms[0];
+      my $condition = $clms[1];
+      my $replicate = $clms[2];
+      my $normFactor = $clms[3];
+      my $coverageFN = $oDIR . "/COVERAGE/" . $file . ".CSIcoverage";
+      my $usageFN = ">" . $oDIR . "/USAGE/" . $file . ".CSIusage";
+      my $bedFN   = ">" . $oDIR . "/BED/" . $file . "_CSIs.BED";
+
+
+      open(COVERAGE, $coverageFN) ||  
+         die("Error in createNormalizedFiles: cannot open $coverageFN for reading");
+      open(USAGE, $usageFN) || 
+         die("Error in createNormalizedFiles: cannot open $usageFN for writing");
+      open(BEDGRAPH, $bedFN) || 
+         die("Error in createNormalizedFiles: cannot open $bedFN for writing");
+      print USAGE "chr\tstart\tend\tID\tscore\(unused\)\tstrand\tnumReads\t";
+      print USAGE "basesCovered\tCSILength\tpercentCovered\tusage\tnormUsage\tgeneID\tgeneSymbol\n";
+      print BEDGRAPH "track type=bedGraph name=\"${file}\"\n";
+      while (my $line = <COVERAGE>){
+         chomp $line;
+         my @clms = split(/\t/, $line);
+         my($currCSIchr, $currCSIbeg, $currCSIend, $currCSIid, $score, $strand, $numReads) = split(/\t/, $line);
+         if($currCSIbeg > $currCSIend) { 
+            my $tmp = $currCSIbeg;
+            $currCSIbeg = $currCSIend;
+            $currCSIend = $tmp;
+         }
+         my $csiLength   = $currCSIend - $currCSIbeg + 1;
+         my $usage;
+         my $normUsage;
+         if($numReads > 0){
+            $usage = (($numReads*$readlength)/($csiLength+$overhang));
+            $normUsage = $normFactor * $usage;
+         }
+         else{
+            $usage = 0;
+            $normUsage = 0;
+          }
+          my $geneID = $annotationHASH{$currCSIid};
+          ## basedCovered matches csiLength; pct covered is 100%
+          my $pctCvg = 1.0000000;
+          print USAGE "$line\t$usage\t$csiLength\t$csiLength\t$pctCvg\t$normUsage\t$geneID\n";
+          print BEDGRAPH "$currCSIchr\t$currCSIbeg\t$currCSIend\n";
+      }
+      close(COVERAGE);
+      close(USAGE);
+      close(BEDGRAPH);
+   }
+   print "PASSED: Normalized Files Created OK\n";
+}
+#-----------------------------------------------------------------------------------
+      
+#-----------------------------------------------------------------------------------
+sub createGroupHash {
+   my($sNameREF, $sCondREF) = @_;
+
+   ##################################################################
+   ## Creates a hash table where the key is the condition and the  ##
+   ## value is the list of samples falling in that condition       ##
+   ##--------------------------------------------------------------##
+   ## INPUT:  $sNameREF (reference of sample name array)           ##
+   ##         $sCondREF (reference to sample condition array)      ##
+   ## OUTPUT: %groups   (hash table of groups with key as condition##
+   ##                    and values as a set of samples in that    ##
+   ##                    condition)                                ##
+   ##################################################################
+
+   my @sampleIDArr = @$sNameREF;
+   my @sampleCondArr = @$sCondREF;
+   my $numSamples = @sampleIDArr;
+   my %groups;
+
+   for(my $i = 0; $i < $numSamples; $i++) { 
+      if(!defined($groups{$sampleCondArr[$i]})) { 
+         $groups{$sampleCondArr[$i]} = $sampleIDArr[$i];
+      }
+      else {
+         $groups{$sampleCondArr[$i]} .= $SEPARATOR . $sampleIDArr[$i];
+      }
+   }
+   print "PASSED: Group Hash Created OK\n";
+   return(%groups);
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub createDataTableHash {
+   my ($gHashREF, $outDir, $prefix, $normCol) = @_;
+
+   ############################################################################
+   ## Creates a hash for the data where the key is the current condition and ##
+   ## CSI and the value is the corresponding CSI usage                       ##
+   ##------------------------------------------------------------------------##
+   ## INPUT:  $gHashREF (reference to group hash array)                      ##
+   ##         $outDir   (output directory)                                   ##
+   ##         $prefix   (prefix to add for output -- typically blank or APA) ##
+   ##         $normCol  (column to use for normalization)                    ##
+   ## OUTPUT: %dataTable (hash with current condition and CSI as the key and ##
+   ##                     normalized CSI usage as the value)                 ##
+   ############################################################################
+
+   my %groupsHASH = %$gHashREF;
+   my @groupARR = sort(keys(%groupsHASH));
+   my $numGroups = @groupARR;
+
+   my %dataTable;
+   for(my $i = 0; $i < $numGroups; $i++) { 
+      my $currCondition = $groupARR[$i];
+
+      my $samplesString = $groupsHASH{$currCondition};
+      my @currSampleARR = split(/$SEPARATOR/, $samplesString);
+      my $numSamples = @currSampleARR;
+      for(my $j = 0; $j < $numSamples; $j++) { 
+         my $currSampleID = $currSampleARR[$j];
+         my $usageFN = $outDir . "/USAGE/" . $currSampleID . $prefix . ".CSIusage";
+         open(USAGE, $usageFN) || die("Error in createDataTableHash: Cannot open $usageFN for reading");
+         my $header = <USAGE>;
+         while(defined(my $line = <USAGE>)) { 
+            chomp($line);
+            my @clms = split(/\t/, $line);
+            my $csi = $clms[3];
+            my $normUsage = $clms[$normCol];
+            my $key = "$currCondition\t$csi";
+            if(!defined($dataTable{$key})) { 
+               $dataTable{$key} = $normUsage;
+            }
+            else {
+               $dataTable{$key} .= $SEPARATOR . $normUsage;
+            }
+         }
+         close(USAGE);
+      }
+   }
+   print "PASSED: Data Table Hash Created OK\n";
+   return(%dataTable); 
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub printReplicateData { 
+   my($dataTableHashREF, $annHashREF, $outDir) = @_;
+
+   #############################################################################
+   ## Prints a file containing the CSI information for every single replicate ##
+   ##-------------------------------------------------------------------------##
+   ## INPUT:  $dataTableHashREF (reference to data table hash)                ##
+   ##         $annHashREF       (reference to annotation hash)                ##
+   ##         $outDir           (output directory)                            ##
+   ## OUTPUT: None                                                            ##
+   #############################################################################
+
+   my %dataTable = %$dataTableHashREF;
+   my %annotationHASH = %$annHashREF;
+
+   my @CSIPerCondKeys = sort(keys(%dataTable));
+   my $numK = @CSIPerCondKeys;
+   my @dataArray;
+
+   for(my $i = 0; $i < $numK; $i++) { 
+      my $csiPerCondition = $CSIPerCondKeys[$i];
+      my $value = $dataTable{$csiPerCondition};
+
+      my @info = split(/\t/, $csiPerCondition);
+      my $condition = $info[0];
+      my $csi = $info[1];
+      my $annotation = $annotationHASH{$csi};
+      my $dataLine = "$condition\t$annotation\t$csi\t";
+      my $currTableLine = $dataTable{$csiPerCondition};
+
+      my @wds = split(/$SEPARATOR/, $currTableLine);
+      my $repNum = @wds;
+      my $normUsageTotal = 0;
+
+      for(my $j = 0; $j<$repNum; $j++){
+         my $normUsage = $wds[$j];
+         $dataLine .= "$normUsage\t";
+         $normUsageTotal += $normUsage;
+      }
+      my $meanNormUsage = ($normUsageTotal/$repNum);
+      $dataLine .= $meanNormUsage;
+      push (@dataArray, $dataLine);
+   }
+   my $outFN = ">" . $outDir . "/replicateDataCollated.txt";
+   open(OUTFILE, $outFN) || die("Error in printReplicateData: Cannot open $outFN for writing");
+   foreach my $line (@dataArray) {
+      print OUTFILE "$line\n";
+   }
+   close(OUTFILE);   
+   print "PASSED: Replicate Data printed OK\n";
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub calc_mean {
+   my ($aREF) = @_;
+
+   #######################################################################
+   ## Reads in an array of values and calculates the mean of the values ##
+   ##-------------------------------------------------------------------##
+   ## INPUT:  $aREF (array reference for values to be averaged)         ##
+   ## OUTPUT: $mean (mean value of array)                               ##
+   #######################################################################
+
+   my @valueARR = @$aREF;
+   my $numVals = @valueARR;
+   my $sum=0;
+   my $mean=0;
+   for(my $i = 0; $i < $numVals; $i++) {
+     $sum+=$valueARR[$i];
+   }
+   if($numVals > 0) { 
+      $mean = $sum / $numVals;
+   }
+   return($mean);
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub getDataHash {
+   my ($cArrREF, $dTableHashREF) = @_;
+
+   ##########################################################################
+   ## Returns the data for each CSI separated into a hash where the key is ##
+   ## the condition label and the value is the data                        ##
+   ##----------------------------------------------------------------------##
+   ## INPUT:  $cArrREF       (reference to condition array)                ##
+   ##         $dTableHashREF (reference to data table hash)                ##
+   ## OUTPUT: %dHASH         (hash of data with condition as the key and   ##
+   ##                         data as the value)                           ##
+   ##########################################################################
+
+   my @CSIPerCondKeys = @$cArrREF;
+   my $numCSIs = @CSIPerCondKeys;
+
+   my %dHASH;
+   my %dataTable = %$dTableHashREF;
+
+   for(my $i = 0; $i < $numCSIs; $i++) { 
+      my $csiPerCondition = $CSIPerCondKeys[$i];
+      my @info = split(/\t/, $csiPerCondition);
+      my $condition = $info[0];
+
+      my $currData = $dataTable{$csiPerCondition};
+      if(!defined($dHASH{$condition})) {
+         $dHASH{$condition} = $currData;
+      }
+      else {
+         $dHASH{$condition} .= $SEPARATOR2 . $currData;
+      }
+   }
+   return(%dHASH);
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub getAnnotHash {
+   my ($cArrREF, $aHashREF) = @_;
+
+   #############################################################################
+   ## Returns the annotation for each CSI separated into a hash where the key ##
+   ## is the condition label and the value is the CSI and corresponding       ##
+   ## corresponding annotation                                                ##
+   ##-------------------------------------------------------------------------##
+   ## INPUT:  $cArrREF  (reference to condtion array)                         ##
+   ##         $aHashREF (reference to annotation hash)                        ##
+   ## OUTPUT: %aHASH    (hash with condition as the key and the CSI and       ##
+   ##                    annotation as the value)                             ##
+   #############################################################################
+   my @CSIPerCondKeys = @$cArrREF;
+   my %annotationHASH = %$aHashREF;
+
+   my $numCSIs = @CSIPerCondKeys;
+
+   my %aHASH;
+   for(my $i = 0; $i < $numCSIs; $i++) { 
+      my $csiPerCondition = $CSIPerCondKeys[$i];
+      my @info = split(/\t/, $csiPerCondition);
+      my $condition = $info[0];
+      my $csi = $info[1];
+      my $annotation = $annotationHASH{$csi};
+      if(!defined($aHASH{$condition})) {
+         $aHASH{$condition} = "$csi\t$annotation";
+      }
+      else {
+         $aHASH{$condition} .= $SEPARATOR2 . "$csi\t$annotation";
+      }
+   }
+   return(%aHASH);
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub testArraySizes {
+   my($aREF1, $aREF2, $errMSG) = @_;
+
+   #####################################################################
+   ## Tests to see if two arrays are the same length and exits if not ##
+   ##-----------------------------------------------------------------##
+   ## INPUT:  $aREF1  (reference to first array)                      ##
+   ##         $aREF2  (reference to second array)                     ##
+   ##         $errMSG (error message to print before exit)            ##
+   ## OUTPUT: None                                                    ##
+   #####################################################################
+
+   my @arr1 = @$aREF1;
+   my @arr2 = @$aREF2;
+   my $arr1len = @arr1;
+   my $arr2len = @arr2;
+   $errMSG .= ": size1: $arr1len size2: $arr2len\n";
+   if($arr1len != $arr2len) {
+      die($errMSG);
+   }
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub countNonZero { 
+   my($a1REF, $a2REF) = @_;
+
+   #############################################################################
+   ## Reads in two arrays of values which are typically the expression values ##
+   ## for two conditions and determines how many of the values are not 0 --   ##
+   ## this is necessary for calcuating p-values due to a bug in the perl      ##
+   ## statistics library                                                      ##
+   ##-------------------------------------------------------------------------##
+   ## INPUT:  $a1REF   (reference to first array)                             ##
+   ##         $a2REF   (reference to second array)                            ##
+   ## OUTPUT: $nonZero (count of non-zero values in both arrays combined      ##
+   #############################################################################
+
+   my @arr1 = @$a1REF;
+   my @arr2 = @$a2REF;
+   my $len1 = @arr1;
+   my $len2 = @arr2;
+
+   my $nonZero = 0;
+
+   for(my $i = 0; $i < $len1; $i++) {
+      if($arr1[$i] != 0) { 
+         $nonZero++;
+      }
+   }
+   for(my $i = 0; $i < $len2; $i++) { 
+      if($arr2[$i] != 0) { 
+         $nonZero++;
+      }
+   }
+   return($nonZero);
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub printExpressionMatrix {
+   my($condHashREF, $dataTableHashREF, $annHashREF, $outDir) = @_;
+
+   ###################################################################
+   ## Prints out an expression matrix for the coverage of each CSI  ##
+   ## for each condition                                            ##
+   ##---------------------------------------------------------------##
+   ## INPUT:  $condHashREF      (reference to condition hash)       ##
+   ##         $dataTableHashREF (reference to data table hash)      ## 
+   ##         $annHashREF       (refernece to annotation hash)      ##
+   ##         $outDir           (output directory)                  ##
+   ## OUTPUT: None                                                  ##
+   ###################################################################
+
+   my %condHASH = %$condHashREF;
+   my %dataTable = %$dataTableHashREF;
+   my %annotationHASH = %$annHashREF;
+
+   my @groupARR = sort(keys(%condHASH));
+   my $numGroups = @groupARR;
+
+   my @condARR = keys(%condHASH);
+   my $numConds = @condARR;
+
+   my @CSIPerCondKeys = sort(keys(%dataTable));
+   my $numCSIs = @CSIPerCondKeys;
+   my %uniqueCSIHash;
+   for(my $i = 0; $i < $numCSIs; $i++) { 
+      my @wds = split(/\t/, $CSIPerCondKeys[$i]);
+      my $currCSI = $wds[1];
+      if(!defined($uniqueCSIHash{$currCSI})) { 
+         $uniqueCSIHash{$currCSI} = $currCSI;
+      }
+   }
+   my @csiKeys = sort(keys(%uniqueCSIHash));
+   my $numUniqueCSIs = @csiKeys;
+   my %CSIExpressionLine;
+   for(my $i = 0; $i < $numUniqueCSIs; $i++) { 
+       my $csi = $csiKeys[$i];
+       my $annot = $annotationHASH{$csi};
+       if(!defined($annot)) { 
+          print "$csi\n";
+       }
+       $CSIExpressionLine{$csi} = $csi . "\t" . $annot;
+   }
+
+   my $outFN = ">" . $outDir . "/ExpressionMatrix.txt";
+   open(OUTFILE, $outFN) || die("Cannot open $outFN for reading");
+   my $hdrLine = "CLEAVAGE_SITE_INTERVAL\tENSEMBL_GENE_ID\tGENE_SYMBOL";
+   for(my $i = 0; $i < $numGroups; $i++) { 
+      my $currCondition = $groupARR[$i];
+      my $samplesString = $condHASH{$currCondition};
+      my @currSampleARR = split(/$SEPARATOR/, $samplesString);
+      my $numSamples = @currSampleARR;
+      for(my $j = 0; $j < $numSamples; $j++) { 
+         $hdrLine .= "\t" . $currSampleARR[$j];
+         my $usageFN = $outDir . "/USAGE/" . $currSampleARR[$j] . ".CSIusage";
+         open(USAGEFILE, $usageFN) || die("Cannot open $usageFN for reading");
+         my $usageFileHDR = <USAGEFILE>;
+         while(defined(my $usageLine = <USAGEFILE>)) { 
+            chomp($usageLine);
+            my @wds = split(/\t/, $usageLine);
+            my $currCSI = $wds[3];
+            my $currCSInormUsage = $wds[11];
+            $CSIExpressionLine{$currCSI} .= "\t" . $currCSInormUsage;
+         }
+         close(USAGEFILE);
+      }
+   }
+   print OUTFILE "$hdrLine\n";
+   for(my $i = 0; $i < $numUniqueCSIs; $i++) { 
+       my $csi = $csiKeys[$i];
+       print OUTFILE "$CSIExpressionLine{$csi}\n";
+   }
+   close(OUTFILE);
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub pairwiseDEXSeqComparisons { 
+   my($annHashREF, $condHashREF, $outDir, $pvalCUT, $FDRCUT) = @_;
+
+   ############################################################################
+   ## Performs a pairwise comparision on a single CSI independently for each ##
+   ## pair of conditions and generates a file of contrast information and    ##
+   ## differential expression for each pairwise comparison using a TTest     ##
+   ## NOTE: This does not take into account all other CSI expression levels  ##
+   ##       for a particular UTR - need to do a separate comparison using    ##
+   ##       other test statistics                                            ##
+   ##------------------------------------------------------------------------##
+   ## INPUT:  $condHashREF      (reference to condition hash)                ##
+   ##         $dataTableHashREF (reference to data table hash)               ##
+   ##         $annHashREF       (reference to annotation hash)               ##
+   ##         $outDir           (output directory)                           ##
+   ##         $pValCUT          (p-value significance cutoff)                ##
+   ##         $FDRCUT           (FDR significance cutoff)                    ##
+   ## OUTPUT: None                                                           ##
+   ############################################################################
+
+   my %condHASH       = %$condHashREF;
+   my %annotHASH      = %$annHashREF;
+   my @condARR        = keys(%condHASH);
+   my $numConds       = @condARR;
+
+   my $contrastDIR = $outDir . "/DifferentialExpression/";
+   makeDirectory($contrastDIR);
+   $contrastDIR .= "DEXSeq/";
+   makeDirectory($contrastDIR);
+   ###############################################
+   ## PERFORM EVERY SINGLE PAIRWISE COMPARISON  ##
+   ###############################################
+   my %exonToCSIHASH;
+
+   my $EXON_CSI_FN = $outDir . "/DEXSeq/Exon_to_CSI.txt";
+   open(EXONCSIFILE, $EXON_CSI_FN) || die("Error opening $EXON_CSI_FN for reading");
+   while(defined(my $line = <EXONCSIFILE>)) { 
+      chomp($line);
+      my($exon, $csi) = split(/\t/, $line);
+      $exonToCSIHASH{$exon} = $csi;
+   }
+   close(EXONCSIFILE);
+   for(my $i = 0; $i < $numConds; $i++) { 
+       my $cond2 = $condARR[$i];
+       ## NOW GET SAMPLES WITH THAT KEY ##
+       my $samples2 = $condHASH{$cond2};
+       my @sample2ARR = split(/$SEPARATOR/, $samples2);
+       my $numS2 = @sample2ARR;
+
+       for(my $j = 0; $j < $numConds; $j++) { 
+          if($i != $j) { ## DON'T COMPARE TO ITSELF!!!! 
+             my $cond1 = $condARR[$j]; 
+             my $workingDIR = $outDir . "/DifferentialExpression/DEXSeq/$cond2" . "_VS_$cond1/";
+             makeDirectory($workingDIR);
+             my $dataDIR    = "../../../DEXSeq/";
+             print "DEXSeq PAIRWISE CSI EXPRESSION: CONTRAST $cond2 VS $cond1\n";
+             my $samples1 = $condHASH{$cond1};
+             my @sample1ARR = split(/$SEPARATOR/, $samples1);
+             my $numS1 = @sample1ARR;
+             
+             my $rFN = $contrastDIR . $cond2 . "_VS_" . $cond1 . ".R";
+             open(RFILE, ">$rFN") || die("Cannot open $rFN for writing");
+             print RFILE "#############################################################\n";
+             print RFILE "## CSI-UTR $cond1 vs $cond2 ##\n";
+             print RFILE "## SCRIPT AUTOMATICALLY GENERATED                          ##\n";
+             print RFILE "#############################################################\n";
+             print RFILE "if (!require(\"DESeq2\")) { \n";
+             print RFILE "    source(\"http://bioconductor.org/biocLite.R\")\n";
+             print RFILE "    biocLite(\"DESeq2\", dependencies=TRUE)  ## INSTALL DESeq2\n";
+             print RFILE "    if(!requre(\"DESeq2\")) stop(\"DESeq2 package not found\")\n";
+             print RFILE "}\n\n";
+             print RFILE "if (!require(\"DEXSeq\")) { \n";
+             print RFILE "    source(\"http://bioconductor.org/biocLite.R\")\n";
+             print RFILE "    biocLite(\"DEXSeq\", dependencies=TRUE)  ## INSTALL DEXSeq\n";
+             print RFILE "    if(!requre(\"DEXSeq\")) stop(\"DEXSeq package not found\")\n";
+             print RFILE "}\n\n";
+             print RFILE "library(\"DESeq2\")\n";
+             print RFILE "library(\"DEXSeq\")\n\n";
+             print RFILE "setwd(\"$workingDIR\")\n";
+             print RFILE "fileArr = c(";
+             my $fileStr = "";
+             my $rowNameStr = "";
+             my $condStr = "";
+             my $libStr = "";
+
+             for(my $f1 = 0; $f1 < $numS1; $f1++) { 
+                if($fileStr ne "") { 
+                   $fileStr .= ", ";
+                   $rowNameStr .= ", ";
+                   $condStr .= ", ";
+                   $libStr .= ", ";
+                }
+                $fileStr .= "\"" . $dataDIR . $sample1ARR[$f1] . ".DEXSeq.counts\"";
+                $rowNameStr .= "\"$sample1ARR[$f1]\"";
+                $condStr .= "\"A_$cond1\"";
+                $libStr .= "\"single-end\""; 
+             }
+             for(my $f2 = 0; $f2 < $numS2; $f2++) { 
+                if($fileStr ne "") { 
+                   $fileStr .= ", ";
+                   $rowNameStr .= ", ";
+                   $condStr .= ", ";
+                   $libStr .= ", ";
+                }
+                $fileStr .= "\"" . $dataDIR . $sample2ARR[$f2] . ".DEXSeq.counts\"";
+                $rowNameStr .= "\"$sample2ARR[$f2]\"";
+                $condStr .= "\"B_$cond2\"";
+                $libStr .= "\"single-end\""; 
+             }
+             print RFILE "$fileStr)\n";
+             my $gffFN = $dataDIR . $sample1ARR[0] . ".DEXSeq.gff";
+             print RFILE "gffFile = \"$gffFN\"\n";
+             print RFILE "sampleTable = data.frame(\n   row.names=c($rowNameStr),\n";
+             print RFILE "   condition=c($condStr),\n   libType=c($libStr)\n)\n\n";
+             print RFILE "diffExp = DEXSeqDataSetFromHTSeq (fileArr, sampleData=sampleTable, \n";
+             print RFILE "                                  design=~sample+exon+condition:exon,\n";
+             print RFILE "                                  flattenedfile=gffFile)\n\n";
+             print RFILE "#########################################\n";
+             print RFILE "## MAY WANT TO UNCOMMENT FOR DEBUGGING ##\n";
+             print RFILE "#########################################\n\n";
+             print RFILE "# colData(diffExp)\n";
+             print RFILE "# head(counts(diffExp), 5)\n";
+             print RFILE "# head(featureCounts(diffExp), 5)\n";
+             print RFILE "# sampleAnnotation(diffExp)\n\n";
+             print RFILE "diffExp = estimateSizeFactors(diffExp)  ## NORMALIZE DATA \n";
+             print RFILE "diffExp = estimateDispersions(diffExp)  ## ESTIMATE DISPERSION \n";
+             print RFILE "# plotDispEst(diffExp) ## PRINT DISPERSION ESTIMATES \n";
+             print RFILE "diffExp = testForDEU(diffExp) ## TEST FOR SIGNIFICANT EVENTS\n";
+             print RFILE "diffExp = estimateExonFoldChanges(diffExp) ## ADD FOLD CHANGE INFORMATION\n";
+             print RFILE "diffExpRegions = DEXSeqResults(diffExp)\n\n";
+             print RFILE "sigP <- diffExpRegions[!(is.na(diffExpRegions\$pvalue)), ]\n";
+             print RFILE "defExp <- sigP\n";
+             print RFILE "sigP <- sigP[(sigP\$pvalue < $pvalCUT), ]\n";
+             print RFILE "sigFDR <- sigP[!(is.na(sigP\$padj)), ]\n";
+             print RFILE "sigFDR <- sigFDR[(sigFDR\$padj < $FDRCUT), ]\n";
+             print RFILE "defExp <- defExp[order(defExp\$pvalue), ]\n";
+             print RFILE "sigFDR <- sigFDR[order(sigFDR\$padj), ]\n\n";
+             print RFILE "# defExp\n";
+             print RFILE "# sigFDR\n\n";  
+             my $sortedFN = "allCSIs_$cond2" . "_VS_$cond1" . "_SORTED.txt";
+             my $regionFN = "allCSIs_$cond2" . "_VS_$cond1" . "_BYREGION.txt";
+             my $sigFN    = "sigCSIs_$cond2" . "_VS_$cond1" . ".txt";
+ 
+             print RFILE "write.table(defExp, file=\"$sortedFN\", sep=\"\\t\")\n";
+             print RFILE "write.table(diffExpRegions, file=\"$regionFN\", sep=\"\\t\")\n";
+             print RFILE "write.table(sigFDR, file=\"$sigFN\", sep=\"\\t\")\n";
+             print RFILE "\n\n";
+             print RFILE "# PLOT RESULTS FOR CAMK4\n";
+             print RFILE "# plotDEXSeq(dxr1, \"ENSMUSG00000038128\", legend=TRUE, cex.axis=1.2, cex=1.3, lwd=2)\n\n";
+
+             close(RFILE);
+             my $checkFile = $workingDIR . $sortedFN;
+             if(!(-e $checkFile)) { 
+                my $cmd = "R CMD BATCH $rFN";
+                system($cmd);
+
+                addCSIInfo($workingDIR, $sortedFN, \%exonToCSIHASH, \%annotHASH);
+                addCSIInfo($workingDIR, $regionFN, \%exonToCSIHASH, \%annotHASH);
+                addCSIInfo($workingDIR, $sigFN, \%exonToCSIHASH, \%annotHASH);
+             }
+             else {
+                print "DEXAnalysis exists for $cond2" . "_VS_$cond1 ... SKIPPING\n";
+             }
+          }
+       }
+   }
+   print "PASSED: DEXSeq COMPARISONS OK\n";
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub addCSIInfo { 
+   my($dir, $fn, $hREF, $aREF) = @_;
+ 
+   my %exonToCSIHash = %$hREF;
+   my %annotHash     = %$aREF;
+
+   my $inFN = $dir . $fn;
+   my $tmpFN = $dir . "tmp.txt";
+
+   open(INFILE, $inFN) || die("Error opening $inFN for reading");
+   open(OUTFILE, ">$tmpFN") || die("error opening $tmpFN for writing");
+   my $hdr = <INFILE>;
+   $hdr = "CSI_ID\tGENE_ID\tGENE_SYMBOL\tEXON_ID\t" . $hdr;
+   print OUTFILE "$hdr";
+ 
+   while(defined(my $line = <INFILE>)) { 
+      chomp($line);
+      $line =~ s/\"//g;
+      my @wds = split(/\t/, $line);
+      my $currExon = $wds[0];
+      $currExon =~ s/\:E/\:/g;
+      my $currCSI  =  $exonToCSIHash{$currExon};
+      if(!defined($currCSI)) { die("ERROR: CSI not defined for $currExon"); }
+      my $currANNOT = $annotHash{$currCSI};
+      print OUTFILE "$currCSI\t$currANNOT\t$line\n";
+   }
+   
+   close(INFILE);
+   close(OUTFILE);
+   my $cmd = "mv $tmpFN $inFN";
+   system($cmd);
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub pairwiseComparisons { 
+   my($condHashREF, $dataTableHashREF, $annHashREF, $outDir, $pvalCUT, $FDRCUT) = @_;
+
+   ############################################################################
+   ## Performs a pairwise comparision on a single CSI independently for each ##
+   ## pair of conditions and generates a file of contrast information and    ##
+   ## differential expression for each pairwise comparison using a TTest     ##
+   ## NOTE: This does not take into account all other CSI expression levels  ##
+   ##       for a particular UTR - need to do a separate comparison using    ##
+   ##       other test statistics                                            ##
+   ##------------------------------------------------------------------------##
+   ## INPUT:  $condHashREF      (reference to condition hash)                ##
+   ##         $dataTableHashREF (reference to data table hash)               ##
+   ##         $annHashREF       (reference to annotation hash)               ##
+   ##         $outDir           (output directory)                           ##
+   ##         $pValCUT          (p-value significance cutoff)                ##
+   ##         $FDRCUT           (FDR significance cutoff)                    ##
+   ## OUTPUT: None                                                           ##
+   ############################################################################
+
+   my %condHASH       = %$condHashREF;
+   my %dataTable      = %$dataTableHashREF;
+   my %annotationHASH = %$annHashREF;
+   my @condARR        = keys(%condHASH);
+   my $numConds       = @condARR;
+   my @CSIPerCondKeys = sort(keys(%dataTable));
+   my $numCSIs        = @CSIPerCondKeys;
+
+   my $contrastDIR = $outDir . "/DifferentialExpression/";
+   makeDirectory($contrastDIR);
+   $contrastDIR .= "PAIRWISE/";
+   makeDirectory($contrastDIR);
+
+   my %dataHASH      = getDataHash(\@CSIPerCondKeys, \%dataTable);
+   my %condAnnotHASH = getAnnotHash(\@CSIPerCondKeys, \%annotationHASH);
+
+#   for(my $i = 0; $i < $numConds; $i++) { 
+   for(my $i = 0; $i < 1; $i++) {  ## TREAT FIRST ONE AS CONTROL FOR NOW
+       my $cond2 = $condARR[$i];
+       my @cond2DataARR = split(/$SEPARATOR2/, $dataHASH{$cond2});
+       my @cond2AnnotARR = split(/$SEPARATOR2/, $condAnnotHASH{$cond2});
+       testArraySizes(\@cond2DataARR, \@cond2AnnotARR, 
+                      "number of data points and annotations for $cond2 does not match");
+
+       for(my $j = $i + 1; $j < $numConds; $j++) { 
+          my $cond1 = $condARR[$j]; 
+          my @cond1DataARR = split(/$SEPARATOR2/, $dataHASH{$cond1});
+          my @cond1AnnotARR = split(/$SEPARATOR2/, $condAnnotHASH{$cond1});
+          my $numDataPointsCond1 = @cond1DataARR;
+          testArraySizes(\@cond1DataARR, \@cond1AnnotARR, 
+                         "number of data points and annotations for $cond1 does not match");
+          print "PAIRWISE CSI EXPRESSION: CONTRAST $cond1 VS $cond2\n";
+          testArraySizes(\@cond1DataARR, \@cond2DataARR, 
+                         "number of data points for $cond1 and $cond2 does not match");
+          my @currCond1DataARR = split(/$SEPARATOR/, $cond1DataARR[0]);
+          my @currCond2DataARR = split(/$SEPARATOR/, $cond2DataARR[0]);
+          my $numSamplesCond1 = @currCond1DataARR;
+          my $numSamplesCond2 = @currCond2DataARR;
+
+          my @pValARR;
+          my @compLineARR;
+ 
+          for(my $k = 0; $k < $numDataPointsCond1; $k++) { 
+             if($cond1AnnotARR[$k] ne $cond2AnnotARR[$k]) {
+                die("ERROR: Annotations $cond1AnnotARR[$k] and $cond2AnnotARR[$k] do not match");
+             }
+             @currCond1DataARR = split(/$SEPARATOR/, $cond1DataARR[$k]);
+             @currCond2DataARR = split(/$SEPARATOR/, $cond2DataARR[$k]);
+
+             checkArraySize(\@currCond1DataARR, $numSamplesCond1, 
+                            "Incorrect number of samples $numSamplesCond1 in $cond1DataARR[$k]");
+             checkArraySize(\@currCond2DataARR, $numSamplesCond2, 
+                            "Incorrect number of samples $numSamplesCond2 in $cond2DataARR[$k]");
+
+             my($sample1mean, $sample2mean, $pVal, $t, $logfc) = 
+                calculateTTestStatistics(\@currCond1DataARR, \@currCond2DataARR);
+             push(@pValARR, $pVal);
+             my $currCompLine = "$cond1AnnotARR[$k]\t$sample1mean\t$sample2mean\t$logfc\t$pVal";
+             push(@compLineARR, $currCompLine);
+          }
+          my $FNPRE = ">" . $contrastDIR . "/" . $cond1 . "_VS_" . $cond2 . "_PAIRWISE_CSI.";
+          my $contrastHDR = contrastHeader($cond1, $cond2);
+          createDEGFiles($contrastDIR, \@pValARR, \@compLineARR,    ## ADD FDR AND WRITE
+                         $pvalCUT, $FDRCUT, $FNPRE, $contrastHDR);  ## OUT FILES
+       }
+   }
+   print "PASSED: PAIRWISE COMPARISONS OK\n";
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub withinUTRComparisons { 
+   my($condHashREF, $dataTableHashREF, $annHashREF, $outDir, $pvalCUT, $FDRCUT) = @_;
+
+   ############################################################################
+   ## Performs a comparision on a single CSI looking at the expression of    ##
+   ## the other CSI expression levels within a UTR across a pair of conditons##
+   ## and generates a file of contrast information and differential          ##
+   ## expression for each comparison using a Fisher's exact test             ##
+   ##------------------------------------------------------------------------##
+   ## INPUT:  $condHashREF      (reference to condition hash)                ##
+   ##         $dataTableHashREF (reference to data table hash)               ##
+   ##         $annHashREF       (reference to annotation hash)               ##
+   ##         $outDir           (output directory)                           ##
+   ##         $pvalCUT          (significance cutoff for pvalue)             ##
+   ##         $FDRCUT           (significance cutoff for FDR value)          ##
+   ## OUTPUT: None                                                           ##
+   ############################################################################
+
+   my %condHASH       = %$condHashREF;
+   my %dataTable      = %$dataTableHashREF;
+   my %annotationHASH = %$annHashREF;
+   my @condARR        = keys(%condHASH);
+   my $numConds       = @condARR;
+   my @CSIPerCondKeys = sort(keys(%dataTable));
+   my $numCSIs        = @CSIPerCondKeys;
+
+   my $contrastDIR = $outDir . "/DifferentialExpression/";
+   makeDirectory($contrastDIR);
+   $contrastDIR .= "WITHIN_UTR/";
+   makeDirectory($contrastDIR);
+
+   my %dataHASH      = getDataHash(\@CSIPerCondKeys, \%dataTable);
+   my %condAnnotHASH = getAnnotHash(\@CSIPerCondKeys, \%annotationHASH);
+
+   for(my $i = 0; $i < $numConds; $i++) { 
+#   for(my $i = 0; $i < 1; $i++) {   ## TREAT FIRST ONE AS CONTROL FOR NOW
+       my $cond2 = $condARR[$i];
+       my @cond2DataARR = split(/$SEPARATOR2/, $dataHASH{$cond2});
+       my @cond2AnnotARR = split(/$SEPARATOR2/, $condAnnotHASH{$cond2});
+       testArraySizes(\@cond2DataARR, \@cond2AnnotARR, 
+                      "number of data points and annotations for $cond2 does not match");
+
+       for(my $j = $i + 1; $j < $numConds; $j++) { 
+          my $cond1 = $condARR[$j]; 
+          my @cond1DataARR = split(/$SEPARATOR2/, $dataHASH{$cond1});
+          my @cond1AnnotARR = split(/$SEPARATOR2/, $condAnnotHASH{$cond1});
+          my $numDataPointsCond1 = @cond1DataARR;
+          testArraySizes(\@cond1DataARR, \@cond1AnnotARR, 
+                         "number of data points and annotations for $cond1 does not match");
+          print "WITHIN UTR COMPARISONS: CONTRAST $cond1 VS $cond2\n";
+          testArraySizes(\@cond1DataARR, \@cond2DataARR, 
+                         "number of data points for $cond1 and $cond2 does not match");
+          my @currCond1DataARR = split(/$SEPARATOR/, $cond1DataARR[0]);
+          my @currCond2DataARR = split(/$SEPARATOR/, $cond2DataARR[0]);
+          my $numSamplesCond1 = @currCond1DataARR;
+          my $numSamplesCond2 = @currCond2DataARR;
+
+          ## NOW RETRIEVE THE NUMBER OF GENES WE HAVE ##
+          my %uniqGeneHASH;
+          my %geneCSIHASH;
+          my %cond1GeneDataHASH;
+          my %cond2GeneDataHASH;
+
+          ## CREATE HASHES FOR CSIs AND COUNTS OF CSIs FOR BOTH CONDITIONS ##
+          ## FOR EACH GENE INDIVIDUALLY                                    ##
+          for(my $k = 0; $k < $numDataPointsCond1; $k++) { 
+             my $currANNOT = $cond1AnnotARR[$k];
+             my @wds = split(/\:/, $currANNOT);
+             my @wds2 = split(/\s+/, $currANNOT);
+             my $geneID = $wds[0];
+             my $currCSI = $wds2[0];
+
+             $uniqGeneHASH{$geneID} = $geneID;
+             if($cond1AnnotARR[$k] ne $cond2AnnotARR[$k]) {
+                die("ERROR: Annotations $cond1AnnotARR[$k] and $cond2AnnotARR[$k] do not match");
+             }
+             if(!defined($geneCSIHASH{$geneID})) { 
+                $geneCSIHASH{$geneID} = $currCSI;
+             }
+             else {
+                $geneCSIHASH{$geneID} .= $SEPARATOR2 . $currCSI;
+             }
+             if(!defined($cond1GeneDataHASH{$geneID})) { 
+                $cond1GeneDataHASH{$geneID} = $cond1DataARR[$k];
+             }
+             else { 
+                $cond1GeneDataHASH{$geneID} .= $SEPARATOR2 . $cond1DataARR[$k];
+             } 
+             if(!defined($cond2GeneDataHASH{$geneID})) { 
+                $cond2GeneDataHASH{$geneID} = $cond2DataARR[$k];
+             }
+             else { 
+                $cond2GeneDataHASH{$geneID} .= $SEPARATOR2 . $cond2DataARR[$k];
+             } 
+          }
+          my @keyArr = keys(%uniqGeneHASH);
+          my $numK = @keyArr;
+          my @pValARR;
+          my @compLineARR;
+
+          ## NOW GET THE VALUES FOR EACH OF THESE FROM EACH SAMPLE ##
+          for(my $k = 0; $k < $numK; $k++) { 
+             my $currCSIList   = $geneCSIHASH{$keyArr[$k]};
+             my $currCond1Data = $cond1GeneDataHASH{$keyArr[$k]};
+             my $currCond2Data = $cond2GeneDataHASH{$keyArr[$k]};
+             my @currCSIARR    = split(/$SEPARATOR2/, $currCSIList);
+             my @currCond1DataARR = split(/$SEPARATOR2/, $currCond1Data);
+             my @currCond2DataARR = split(/$SEPARATOR2/, $currCond2Data);
+             my $numCSIs = @currCSIARR;
+             my $numCSIs2 = @currCond1DataARR;
+             my $numCSIs3 = @currCond2DataARR;
+             if(($numCSIs2 != $numCSIs) || ($numCSIs3 != $numCSIs)) {
+                die("ERROR: $numCSIs $numCSIs2 $numCSIs3 Number of datapoints incorrect for gene $keyArr[$k]\n");
+             }
+             my @cond1SumARR;
+             my @cond2SumARR;
+             my $cond1Tot;
+             my $cond2Tot;
+             my $minVal = 1;
+
+             ## NEED TO COMPUTE OVERALL STATISTICS FOR ALL CSIs BEFORE ##
+             ## SIGNIFICANT VALUES CAN BE DETERMINED                   ##
+             for(my $UTR_CSIindex = 0; $UTR_CSIindex < $numCSIs; $UTR_CSIindex++) { 
+                my @cond1RepArr = split(/$SEPARATOR/, $currCond1DataARR[$UTR_CSIindex]);
+                my @cond2RepArr = split(/$SEPARATOR/, $currCond2DataARR[$UTR_CSIindex]);
+                my $numCond1Reps = @cond1RepArr;
+                my $numCond2Reps = @cond2RepArr;
+                my $currCount = 0;
+                for(my $repIndex = 0; $repIndex < $numCond1Reps; $repIndex++) { 
+                   $currCount += $cond1RepArr[$repIndex];
+                }
+                if($currCount < $minVal) { $currCount = $minVal; }
+                push(@cond1SumARR, $currCount);
+                $cond1Tot += $currCount;
+
+                $currCount = 0;
+                for(my $repIndex = 0; $repIndex < $numCond2Reps; $repIndex++) { 
+                   $currCount += $cond2RepArr[$repIndex];
+                }
+                if($currCount < $minVal) { $currCount = $minVal; }
+                push(@cond2SumARR, $currCount);
+                $cond2Tot += $currCount;
+             }
+
+             ## TEST SIGNIFICANCE FOR EACH CSI NOW ##
+             for(my $UTR_CSIindex = 0; $UTR_CSIindex < $numCSIs; $UTR_CSIindex++) { 
+                 my ($pVal, $PSI1, $PSI2, $deltaPSI) = 
+                    getCompStats ($cond1SumARR[$UTR_CSIindex], $cond1Tot,
+                                  $cond2SumARR[$UTR_CSIindex], $cond2Tot, $numCSIs);
+                 push(@pValARR, $pVal);
+                 
+                 my $currCSIid = $currCSIARR[$UTR_CSIindex];
+                 my $currCSIann = $annotationHASH{$currCSIid};
+                 my $currCompLine = "$currCSIid\t$currCSIann\t$PSI1\t$PSI2\t$deltaPSI\t$pVal";
+                 push(@compLineARR, $currCompLine);
+             } 
+          }
+          my $FNPre = ">" . $contrastDIR . "/" . $cond1 . "_VS_" . $cond2 . "_CSI.WITHINUTR";
+          my $contrastHDR =  "CSI\tENSGENE\tGENE_SYM\tPSI1 ($cond1)\tPSI2 ($cond2)\t";
+          $contrastHDR .= "deltaPSI ($cond1-$cond2)\tP-value\tFDR\n";
+          createDEGFiles($contrastDIR, \@pValARR, \@compLineARR,
+                         $pvalCUT, $FDRCUT, $FNPre, $contrastHDR);
+       }
+   }
+   print "PASSED: WITHIN UTR COMPARISONS OK\n";
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub getCompStats {
+   my($c1Val, $c1Tot, $c2Val, $c2Tot, $CSIcnt) = @_;
+
+   #################################################################################
+   ## Computes the statistics for the current CSI using the Fisher exact test     ##
+   ##-----------------------------------------------------------------------------##
+   ## INPUT:  $c1Val     (normalized count for the current CSI in condition 1)    ##
+   ##         $c1Tot     (total normalized counts for all CSIs within the current ##
+   ##                     UTR in condition 1)                                     ##
+   ##         $c2Val     (normalized count for the current CSI in condition 2)    ##
+   ##         $c2Tot     (total normalized counts for all CSIs within the current ##
+   ##                     UTR in condition 2)                                     ##
+   ##         $CSIcnt    (number of CSIs within the current UTR)                  ##
+   ## OUTPUT: @retArr   (array consisting of p-value, PSI1, PSI2, and deltaPSI    ##
+   ##                    statistics for the current CSI within the current UTR    ##
+   ##                    comparing condition 1 to condition 2)                    ##
+   ##=============================================================================##
+   ## NOTE: Contingency table for Fisher's exact test is set up as follows:       ##
+   ##                                                                             ##
+   ##       |a11 a12| n1p                                                         ##
+   ##       |a21 a22| n2p                                                         ##
+   ##       ---------                                                             ##
+   ##        np1 np2  npp                                                         ## 
+   #################################################################################
+
+   my $pVal = 1;
+   my $PSI1 = 1;
+   my $PSI2 = 1;
+   my $deltaPSI = 0;
+
+   if($CSIcnt > 1) {   ## NEED TO HAVE AT LEAST 2 CSIs to COUNT!!!
+      $PSI1 = int($c1Val/$c1Tot * 1000000) / 1000000;
+      $PSI2 = int($c2Val/$c2Tot * 1000000) / 1000000;
+      $deltaPSI = $PSI1-$PSI2;
+
+      ## CREATE CONTINGENCY TABLE FOR FISHER EXACT TEST
+      my $a11 = int($c1Val);
+      my $a12 = int($c1Tot - $a11);
+      my $a21 = int($c2Val);
+      my $a22 = int($c2Tot - $a21);
+      my $n1p = $a11 + $a12;
+      my $n2p = $a21 + $a22;
+      my $np1 = $a11 + $a21;
+      my $np2 = $a12 + $a22;
+      my $npp = $np1 + $np2;
+
+      ## CALCULATE FISHER EXACT TEST ##
+      $pVal = calculateStatistic(n11=>int($a11), n1p=> int($n1p), 
+                                 np1 =>int($np1), npp => int($npp));
+      $pVal = int($pVal * 1000000) / 1000000;
+                  
+      ## Correct for rounding errors ##
+      if($pVal > 1) { $pVal = 1; }
+      if($pVal < 0) { $pVal = 0; }
+   }
+   my @retARR = ($pVal, $PSI1, $PSI2, $deltaPSI);
+   return(@retARR);
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub createDEGFiles { 
+   my($cDIR, $pValREF, $outARRREF, $pvalCUT, $FDRCUT, $FNPre, $hdr) = @_;
+
+   #################################################################################
+   ## Creates the output files for the within UTR differential expression files   ##
+   ## for ALL, p-value cutoffs, and q-value cutoffs                               ##
+   ##-----------------------------------------------------------------------------##
+   ## INPUT:  $cDIR      (contrast output directory to write files)               ##
+   ##         $pValREF   (reference to array of pvalues)                          ##
+   ##         $outARRREF (reference to array of information for each gene in the  ##
+   ##                     current comparison)                                     ##
+   ##         $pvalCUT   (significance cutoff for pvalue)                         ##
+   ##         $FDRCUT    (significance cutoff for FDR value)                      ##
+   ##         $FNPre     (prefix for output files)                                ##
+   ##         $hdr       (column headers for output files)                        ##
+   ## OUTPUT: NONE                                                                ##
+   #################################################################################
+   
+   my @pARR = @$pValREF;
+   my @outARR = @$outARRREF;
+
+   my $contrastFN = $FNPre . ".diff.txt";
+   my $PdegFN     = $FNPre . ".degPval_" . $pvalCUT . ".txt";
+   my $FDRdegFN   = $FNPre . ".degFDR_" . $FDRCUT . ".txt";
+   open(CONTRASTFILE, $contrastFN) || die("Cannot open $contrastFN for writing");
+   open(PDEGFILE, $PdegFN)         || die("Cannot open $PdegFN for writing");
+   open(FDRDEGFILE, $FDRdegFN)     || die("Cannot open $FDRdegFN for writing");
+
+   print CONTRASTFILE $hdr;
+   print PDEGFILE     $hdr;
+   print FDRDEGFILE   $hdr;
+
+   my $bhREF = Statistics::Multtest::BH(\@pARR);  ## Benjamini-Hochberg FDR correction
+   my @FDRarr = @$bhREF;
+   my $num = @FDRarr;
+   my $sigFDR = 0;
+   my $sigPVal = 0;
+   for(my $i = 0; $i < $num; $i++) {
+      $outARR[$i] .= "\t$FDRarr[$i]\n";   ## ADD FDR value to curr line
+      print CONTRASTFILE "$outARR[$i]";
+      if($pARR[$i] <= $pvalCUT) { 
+         print PDEGFILE "$outARR[$i]";
+         $sigPVal++;
+      }
+      if($FDRarr[$i] <= $FDRCUT) { 
+         print FDRDEGFILE "$outARR[$i]";
+         $sigFDR++;
+      }  
+   }
+   close(CONTRASTFILE);
+   close(PDEGFILE);
+   close(FDRDEGFILE);
+   print "SIGNIFICANT (Pval < $pvalCUT) = $sigPVal; (FDR < $FDRCUT) = $sigFDR\n";
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub calculateTTestStatistics {
+   my($data1REF, $data2REF) = @_;
+
+   #################################################################################
+   ## Calculates the test statistics based on a t-test for the values in 2 arrays ##
+   ##-----------------------------------------------------------------------------##
+   ## INPUT:  $data1REF (reference to data1 array)                                ##
+   ##         $data2REF (reference to data2 array)                                ##
+   ## OUTPUT: @retArr   (array consisting of mean for data1, mean for data2,      ##
+   ##                    t-test p-value, t-test t score, and logFC)               ##
+   #################################################################################
+   
+   my @data1 = @$data1REF;
+   my @data2 = @$data2REF;
+
+   my $sample1mean = calc_mean(\@data1);
+   my $sample2mean = calc_mean(\@data2);
+   my $pVal = 1;
+   my $t    = 0;
+   my $fc = ($sample1mean + 0.01) / ($sample2mean + 0.01);
+   my $logfc = log($fc)/log(2);
+
+   ##########################################
+   ## Create two significant digit cutoffs ##
+   ##########################################
+   $sample1mean = int($sample1mean * 100) / 100;
+   $sample2mean = int($sample2mean * 100) / 100;
+
+   ##################################################
+   ## Need to perform the following step due to an ##
+   ## issue in the TTest library                   ##
+   ##################################################
+   my $nonZero = countNonZero(\@data1, \@data2);
+
+   if($nonZero > 1) { 
+      my $ttest = new Statistics::TTest;
+      $ttest->load_data(\@data1, \@data2);
+      $pVal = $ttest->{t_prob};
+      $t    = $ttest->t_statistic;
+   }
+   $logfc = int($logfc * 100) / 100;
+
+   my @retArr = ($sample1mean, $sample2mean, $pVal, $t, $logfc);
+   return(@retArr);
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub checkArraySize {
+   my($a1REF, $a1exp, $errMsg) = @_;
+
+   ################################################################### 
+   ## Checks to see if an array is of the expected length           ## 
+   ##---------------------------------------------------------------##
+   ## INPUT:  $a1REF  (reference to array)                          ##
+   ##         $a1exp  (expected length of array)                    ##
+   ##         $errMsg (error message to print before exit)          ##
+   ## OUTPUT: None                                                  ##
+   ###################################################################
+ 
+   my @a1 = @$a1REF;
+   my $a1obs = @a1;
+   if($a1obs != $a1exp) { 
+      die($errMsg);
+   }
+   return();
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub contrastHeader {
+   my($c1, $c2) = @_;
+
+   ########################################################################
+   ## Creates the header to be printed as the top line in the contrasts  ##
+   ## output files                                                       ##
+   ##--------------------------------------------------------------------##
+   ## INPUT:  $c1 (contrast 1 description)                               ##
+   ##         $c2 (contrast 2 description)                               ##
+   ## OUTPUT: $retString (header line based on contrast descriptions)    ##
+   ########################################################################
+
+   my $retString = "CLEAVAGE_SITE_INTERVAL\tENSEMBL_GENE_ID\tGENE_SYMBOL\t" . $c1 . "_MEAN\t";
+   $retString .=   $c2 . "_MEAN\tLOG2FC(" . $c1 . "/" . $c2 . ")\tP-Value\tFDR\n";
+   return($retString);
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub getCutoffCSIs {
+   my ($oDIR, $sampleArrREF, $coverageCut, $usageCut) = @_;
+
+   #################################################################################
+   ## Retrieves CSIs that meet specified coverage and usage cutoffs, returning an ##
+   ## array and writing the results to a file                                     ##
+   ##-----------------------------------------------------------------------------##
+   ## INPUT:  $oDIR         (output directory)                                    ##
+   ##         $sampleArrREF (reference to sample array)                           ##
+   ##         $coverageCut  (coverage cutoff value - default 0.8)                 ##
+   ##         $usageCut     (usage cutoff value - default 1.0)                    ##
+   ## OUTPUT: @expressedCSsUnique (array of uniquely expressed CSI IDs)           ##
+   ##=============================================================================##
+   ## TODO: Evaluate the appropriateness of the coverage and usage cutoffs in the ##
+   ##       overall analysis                                                      ##
+   #################################################################################
+
+   my @sampleNameArr = @$sampleArrREF;
+   my @expressedCSIs;
+
+   foreach my $currSampleName (@sampleNameArr) { 
+      my $inFN = $oDIR . "/USAGE/" . $currSampleName . ".CSIusage";
+      open(INFILE, $inFN) || die("Error in getCutoffCSIs: cannot open $inFN for reading");
+      my $header = <INFILE>;
+      while(defined(my $line = <INFILE>)){
+         chomp $line;
+         my @clms = split(/\t/,$line);
+         my $CSIchr    = $clms[0];
+         my $CSIbeg    = $clms[1];
+         my $CSIend    = $clms[2];
+         my $CSIname   = $clms[3];
+         my $CSIscore  = $clms[4];
+         my $CSIstrand = $clms[5];
+         my $coverage  = $clms[9];
+         my $usage     = $clms[10];
+
+         my $CSIid = "$CSIchr\t$CSIbeg\t$CSIend\t$CSIname\t$CSIscore\t$CSIstrand";
+
+         if(($coverage >= $coverageCut) && ($usage >= $usageCut)){
+            push @expressedCSIs, $CSIid;
+         }
+      }
+      close(INFILE);
+   }
+
+   ## print expressed CSIs passing coverage and usage filters to file ##
+   my @expressedCSIsUnique = uniq @expressedCSIs;
+   my $expressedDIR = $oDIR . "/ExpressedContiguous/";
+   makeDirectory($expressedDIR);
+   my $outFN = ">" . $expressedDIR . "expressedCSIs";
+   open(EXPRESSED, $outFN) || 
+      die("Error in getCutoffCSIs: cannot open $outFN for writing");
+
+   foreach my $id (sort @expressedCSIsUnique){
+      print EXPRESSED "$id\n";
+   }
+   close(EXPRESSED);
+   print "PASSED: Unique Expressed CSIs determined\n";
+   return(@expressedCSIsUnique);
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub filterNonContiguousCSIs {
+   my ($uniqREF, $oDir, $aHashREF, $altHashREF, $completeHashREF) = @_;
+
+   ###################################################################################
+   ## Filters out non-contiguous CSIs (in other words: find gaps) -- the last       ##
+   ## contiguous CSI could be the true end of the 3'UTR, but gaps could be introns. ##
+   ##-------------------------------------------------------------------------------##
+   ## INPUT:  $uniqREF         (reference to unique CSI array)                      ##
+   ##         $oDIR            (output directory)                                   ##
+   ##         $aHashREF        (reference to annotation hash)                       ##
+   ##         $altHashREF      (reference to alternate annotation hash)             ##
+   ##         $completeHashREF (reference to complete annotation hash)              ##
+   ## OUTPUT: None                                                                  ##
+   ##===============================================================================##
+   ## TODO: Consider splice sites in future versions rather than end of UTR         ##
+   ##       Need to clean up this subroutine                                        ##
+   ###################################################################################
+
+   my @expressedCSIsUnique = @$uniqREF;
+   my %annotationHASH = %$aHashREF;
+   my %annotationAltHASH = %$altHashREF;
+   my %annotationCompleteHASH = %$completeHashREF;
+
+   #split strands
+   #create %'accession:stop'{@'start-stop'} for each strand
+   my %csiGroupsPOS; #+ strand
+   my %csiGroupsNEG; #- strand
+   my $numPos = 0;
+   my $numNeg = 0;
+   foreach my $line (@expressedCSIsUnique){
+      my @clms = split(/\t/,$line);
+      #chr1   225947       226735       ENSRNOG019132:225947_225947-226735        1       +
+
+      my $strand = $clms[5];
+      my $intervalPOS = "$clms[1]-$clms[2]";
+      my $intervalNEG = "$clms[2]-$clms[1]";
+      my @info = split(/:/,$clms[3]);
+      my $accession = $info[0];
+      my @positions = split(/_/,$info[1]);
+      my $stopCodon = $positions[0];
+      my $csiGroupID = "$accession:$stopCodon";
+      if($strand =~ /\+/){
+         if(!defined($csiGroupsPOS{$csiGroupID})) {
+            $csiGroupsPOS{$csiGroupID} = $intervalPOS;
+         }
+         else {
+            $csiGroupsPOS{$csiGroupID} .= $SEPARATOR . $intervalPOS;
+         } 
+         $numPos++;
+      }
+      else{
+         if(!defined($csiGroupsNEG{$csiGroupID})) {
+            $csiGroupsNEG{$csiGroupID} = $intervalNEG;
+         }
+         else {
+            $csiGroupsNEG{$csiGroupID} .= $SEPARATOR . $intervalNEG;
+         } 
+         $numNeg++;
+      }
+   }
+   my($contigPosREF, $nonContigPosREF, $totPosCSIs, $contigtestPos, $noncontigtestPos) = filterContiguousCSIs(\%csiGroupsPOS, "+");
+   my($contigNegREF, $nonContigNegREF, $totNegCSIs, $contigtestNeg, $noncontigtestNeg) = filterContiguousCSIs(\%csiGroupsNEG, "-");
+   my @contigPosARR = @$contigPosREF;
+   my @contigNegARR = @$contigNegREF;
+   my @nonContigPosARR = @$nonContigPosREF;
+   my @nonContigNegARR = @$nonContigNegREF;
+   my @contiguous = @contigPosARR;
+####
+##   my $nc = @contigNegARR;
+##   for(my $ci = 0; $ci < $nc; $ci++) { 
+##      print "$ci $contigNegARR[$ci]\n";
+##   }
+##   print "DONE WITH NEGATIVE CONTIGUOUS\n";
+##   exit (0);
+####
+   push(@contiguous, @contigNegARR);
+   my @nonContiguous = @nonContigPosARR;
+   push(@nonContiguous, @nonContigNegARR);
+
+   printContiguousStatsFile($oDir, $numPos, $numNeg, $totPosCSIs, $totNegCSIs, 
+                            $contigtestPos, $contigtestNeg, $noncontigtestPos, $noncontigtestNeg);
+   ## ECR -- ISSUE IN printContiguousInformation ##
+   ##         CHECK ON ANNOTATION HASH           ##
+   printContiguousInformation($oDir, \@contiguous, \@nonContiguous, $completeHashREF);
+   printMaxUTRInformation ($oDir, \@contiguous, $altHashREF);
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub printContiguousStatsFile {
+   my ($oDir, $numPos, $numNeg, $totalPlusCSIs, $totalNegCSIs, $contigtestPlus, 
+       $contigtestNeg, $noncontigtestPlus, $noncontigtestNeg) = @_;
+
+   ###########################################################################
+   ## Prints the statistics for the contiguous and non-contiguous CSIs      ##
+   ##-----------------------------------------------------------------------##
+   ## INPUT:  $oDIR              (output directory)                         ##
+   ##         $numPos            (number of expressed CSIs on the + strand) ##
+   ##         $numNeg            (number of expressed CSIs on the - strand) ##
+   ##         $totalPlusCSIs     (total number of CSIs on the + strand)     ##
+   ##         $totalNegCSIs      (total number of CSIs on the - strand)     ##
+   ##         $contigtestPlus    (contiguous CSIs on + strand)              ##
+   ##         $contigtestNeg     (contiguous CSIs on - strand)              ##
+   ##         $noncontigtestPlus (non-contiguous CSIs on + strand)          ##
+   ##         $noncontigtestNeg  (non-contiguous CSIs on - strand)          ##
+   ## OUTPUT: NONE                                                          ##
+   ##=======================================================================##
+   ## TODO: NOW NEED TO set @contiguous to concatenation of @contigPosArr   ##
+   ##       and @contigNegArr.  Need to set @nonContiguous to concatentation##
+   ##       of @nonContigPosARR and @nonContigNegArr  (NOTES FROM PREVIOUS) ##
+   ###########################################################################
+
+   my $statsFN = ">" . $oDir . "/ExpressedContiguous/ContiguityTests_stats.txt";
+   open(STATSFILE, $statsFN) || 
+      die("Error in filterNoncontiguousCSIs: Cannot open $statsFN for writing");
+   print STATSFILE "Number of CSIs that meet cutoffs: Positive strand = $numPos\t";
+   print STATSFILE "Negative strand = $numNeg\tTotal = ".($numPos+$numNeg)."\n\n";
+   print STATSFILE "Total \+strand CSIs examined: $totalPlusCSIs\n";
+   print STATSFILE "\t\+strand contiguous CSIs: $contigtestPlus\n";
+   print STATSFILE "\t\+strand non-contiguous CSIs: $noncontigtestPlus\n";
+   print STATSFILE "Total \-strand CSIs examined: $totalNegCSIs\n";
+   print STATSFILE "\t\-strand contiguous CSIs: $contigtestNeg\n";
+   print STATSFILE "\t\-strand non-contiguous CSIs: $noncontigtestNeg\n";
+   close STATSFILE;
+} 
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub filterContiguousCSIs {
+   my($csiGrpREF, $strand) = @_;
+
+   ########################################################################
+   ## Filters out non-contiguous segments in each CSI group to result in ##
+   ## only contiguous CSIs                                               ##
+   ##--------------------------------------------------------------------##
+   ## INPUT:   $csiGrpREF (reference to CSI groups HASH)                 ##
+   ##          $strand    (strand to consider for filtering, either +/-  ##
+   ## OUTPUT:  @contiguous (array of contiguous CSIs)                    ##
+   ##          @nonContiguous (array of non-contiguous CSIs)             ##
+   ##          $totalCSIs     (total number of CSIs)a                    ##
+   ##          $contigtest    (
+   ##          $noncontigtest (
+   ##====================================================================##
+   ## NOTE: ***remember to lable each CSI by position from stop***       ##
+   ########################################################################
+
+   my %csiGroups = %$csiGrpREF;
+
+   my @contiguous;
+   my @nonContiguous;
+   my $noncontigtest = 0;
+   my $contigtest    = 0;
+   my $totalCSIs     = 0;
+
+   foreach my $csiGroupID (sort keys %csiGroups){
+      my @info = split(/:/,$csiGroupID);
+      my $stopCodon = $info[1];
+
+      my @intervalsArr = split(/$SEPARATOR/, $csiGroups{$csiGroupID});
+      my $totalCSIs = @intervalsArr;
+      my $arraySize = @intervalsArr;
+      my @sortedIntervalsArr;
+      if($strand eq "+") { 
+         @sortedIntervalsArr = (sort @intervalsArr);
+      }
+      else {
+         ## Need to rearrange start and stop of interval for negative strand
+         @sortedIntervalsArr = (sort {$b cmp $a} @intervalsArr);
+      }
+
+      #find contigs and push to array. Use single element buffer
+      my $prevInterval = $sortedIntervalsArr[0];
+      my @prevPositions = split(/\-/,$prevInterval);
+      my $csiOrder  = 1;
+      my $prevStart = $prevPositions[0];
+      my $prevEnd   = $prevPositions[1];
+
+      if($prevStart == $stopCodon){
+         push @contiguous, "${csiGroupID}_$sortedIntervalsArr[0]\t$csiOrder";
+         $contigtest++;
+         for(my $i=1; $i<$arraySize; $i++){
+            $csiOrder++;
+            my $interval = "$sortedIntervalsArr[$i]";
+            my @positions = split(/\-/,$interval);
+            my $start = $positions[0];
+            my $end = $positions[1];
+ 
+            ## NOTE: $csiGroupID and ${csiGroupID} are the same -- the latter ##
+            ##       tells where the end of the variable is so additional     ##
+            ##       charaters can be appended                                ##
+
+            if($start == $prevEnd){  ## Contiguous CSI
+               push @contiguous, "${csiGroupID}_$sortedIntervalsArr[$i]\t$csiOrder";
+               $contigtest++;
+               $prevEnd = $end;
+            }
+            else{ ## non-contiguous CSI (maybe splicing occurring -- will deal with later)
+               push @nonContiguous, "${csiGroupID}_$sortedIntervalsArr[$i]";
+               $noncontigtest++;
+            }
+         }
+      }
+      else{
+         push @nonContiguous, "${csiGroupID}_$sortedIntervalsArr[0]";
+         $noncontigtest++;
+      }
+   }
+   return(\@contiguous, \@nonContiguous, $totalCSIs, $contigtest, $noncontigtest);
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub printMaxUTRInformation {
+   my($oDir, $contREF, $altREF) = @_;
+
+   ####################################################################
+   ## Collate contiguous CSIs to determine MAX EXPRESSED 3'UTR       ##
+   ## and prints out the max expressed 3'UTR to a file               ##
+   ##----------------------------------------------------------------##
+   ## INPUT:  $oDir    (output directory)                            ##
+   ##         $contREF (referene to contiguous CSIs hash)            ##
+   ##         $altREF  (reference to alternate annotation hash)      ##
+   ## OUTPUT: None                                                   ##
+   ##================================================================##
+   ## NOTES:                                                         ##
+   ##   Parse %csiGroup{@positions) from @contiguous array           ##
+   ##   ENSRNOG00000000007:56900898_56902157-56902387 1              ##
+   ##   NM_001012019:87235269_87235152-87235067                      ##
+   ####################################################################
+
+   my @contiguous        = @$contREF;
+   my %annotationAltHASH = %$altREF;
+
+   my %contigData;
+   foreach my $line (@contiguous){
+      if($line =~ /(.*):(\d+)_(\d+)\-(\d+)\t(\d+)/){
+         my $stopID   = $1.":".$2;
+         my $start    = $3;
+         my $end      = $4;
+         my $position = $5;
+         push (@{$contigData{$stopID}}, ($start,$end));
+      }
+   }
+   my @maxUTRInterval;
+   my $outFN = ">" . $oDir . "/ExpressedContiguous/expressed.contiguous3UTRs.txt";
+   my $bedFN = ">" . $oDir . "/ExpressedContiguous/expressed.contiguous3UTRs.BED";
+   
+   open(OUT, $outFN) || die("Cannot open $outFN for writing");
+   open(BED, $bedFN) || die("Cannot open $bedFN for writing");
+
+   foreach my $stopID (sort keys %contigData){
+      my @dataArr;
+      foreach my $position (@{$contigData{$stopID}}){
+         push @dataArr, $position;
+      }
+      my @sortedDataArr = (sort {$a<=>$b} @dataArr);
+      my $begin = $sortedDataArr[0];
+      my $end   = $sortedDataArr[-1];
+      push (@maxUTRInterval, "${stopID}_$begin\-$end");
+      ##Annotate and print to BED file
+      my $annotation = $annotationAltHASH{$stopID};
+      print OUT "$annotation\t$begin\t$end\n";
+      my @tmp = split(/\t/, $annotation);
+      my $numWds = @tmp;
+      if($numWds < 6) { 
+         die("ERROR IN SPLITTING INFORMATION");
+      }
+      for(my $i = 0; $i < 6; $i++) { 
+         if($i > 0) { 
+            print BED "\t";
+         }
+         print BED "$tmp[$i]";
+      }
+      print BED "\n"; 
+   }
+   close(OUT);
+   close(BED);
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub printContiguousInformation {
+   my($oDir, $contREF, $nonREF, $aHashREF) = @_;
+
+   ######################################################################
+   ## Prints out the CSIs that are contiguous or non-contiguous to the ##
+   ## corresponding file                                               ##
+   ##------------------------------------------------------------------##
+   ## INPUT : $oDir     output directory                               ##
+   ##         $contREF  reference to array of contiguous CSIs          ##
+   ##         $nonREF   reference to array of non-contig CSIs          ##
+   ##         $aHashREF reference to annotation hash array             ##
+   ## OUTPUT: creates contiguousCSIs and nonContiguousCSIs files       ##
+   ######################################################################
+ 
+   my @contiguous     = @$contREF;
+   my @nonContiguous  = @$nonREF;
+   my %annotationHASH = %$aHashREF;
+
+   my $contiguousFN    = ">" . $oDir . "/ExpressedContiguous/contiguousCSIs";
+   open(CONTIGFILE, $contiguousFN)       || 
+      die("Error: Cannot open $contiguousFN for writing");
+
+   print CONTIGFILE "chr\tstart\tend\tcsiID\tscore(unused)\tstrand\tgeneID\t";
+   print CONTIGFILE "geneSymbol\tposition (from stop codon)\n";
+
+   ## FOR CONTIGUOUS CSIs, PRINT CSI INFORMATION AND ANNOTATION ##
+   foreach my $contigCSI (@contiguous){
+      my @clms = split(/\t/,$contigCSI);
+      my $currCSIid = $clms[0];
+      my $currCSIendPos = $clms[1];
+      my $currCSIannot = $annotationHASH{$currCSIid};
+      if(!defined($currCSIannot)) { print "UNDEFINED ANNOTATION FOR $currCSIannot\n"; }
+      print CONTIGFILE "$currCSIannot\t$currCSIendPos\n";
+   }
+   close CONTIGFILE;
+
+   ## FOR NON-CONTIGOUS CSIs, JUST PRINT CSI identifier ##
+   my $NONcontiguousFN = ">" . $oDir . "/ExpressedContiguous/nonContiguousCSIs";
+   open(NONCONTIGFILE, $NONcontiguousFN) || 
+      die("Error: Cannot open $NONcontiguousFN for writing");
+
+   foreach my $nonContigCSI (@nonContiguous){
+      print NONCONTIGFILE "$nonContigCSI\n";
+   }
+   close NONCONTIGFILE;
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub getStopID {
+   my ($s) = @_;
+ 
+   #####################################################################################
+   ## Retrieves the stop location of the current CSI ID where CSI ID is of the form:  ##
+   ##     NM_001277694:15613750_15613752-15614442                                     ##
+   ##---------------------------------------------------------------------------------##
+   ## INPUT : $s      (Current CSI ID)                                                ##
+   ## OUTPUT: @retArr (array containing both the stopID and usage for the current CSI)##
+   #####################################################################################
+
+   my @clms = split(/\t/,$s);
+   my $usage = $clms[10];
+   my $CSIid = $clms[3]; 
+   my $stopID;
+
+   if($CSIid =~ /(.*):(\d+)_(.*)/){
+      $stopID = $1.":".$2;
+   }
+   else {
+      die("error in getStopID:  malformed CSI usage line $s");
+   }
+
+   my @retArr = ($stopID, $usage);
+   return(@retArr);
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub calculateInternal3utrusage_APA {
+   my ($origOUTDIR, $sNameREF) = @_;
+
+   ###########################################################################
+   ## Calculates the internal 3' UTR useage for alternative polyadenylation ##
+   ##-----------------------------------------------------------------------##
+   ## INPUT:  $origOUTDIR (original output directory)                       ##
+   ##         $sNameREF   (reference to sample name array)                  ##
+   ## OUTPUT: None                                                          ##
+   ###########################################################################
+
+   my @sampleNames = @$sNameREF;
+   my $numSamples = @sampleNames;
+   my $oDIR = $origOUTDIR . "/ExpressedContiguous/";
+   my $apaDIR = $oDIR . "/APA/";
+   my $apaUsageDIR = $apaDIR . "/USAGE/";
+   my $apaCSIDIR = $apaDIR . "/CSI/";
+   makeDirectory($apaDIR);
+   makeDirectory($apaUsageDIR);
+   makeDirectory($apaCSIDIR);
+
+   for(my $i = 0; $i < $numSamples; $i++) {
+      my $currSample = $sampleNames[$i];
+
+      ###################################################
+      ## Find the end location for each contiguous CSI ##
+      ###################################################
+      my $inFN = $oDIR . "/USAGE/" . $currSample . ".CSIusage";
+      open(CONTIGUSAGE, $inFN) || 
+         die("ERROR in calculateInternal3utrusage_APA: Cannot open $inFN for reading");
+ 
+      my $header = <CONTIGUSAGE>;
+      my %contigUse;
+
+      while(my $line = <CONTIGUSAGE>){
+         chomp $line;
+         my ($stopID, $usage) = getStopID($line);
+         $contigUse{$stopID} = $usage;
+      }
+      close(CONTIGUSAGE);
+
+      my $csiUsageFN     = $origOUTDIR . "/USAGE/" . $currSample . ".CSIusage";
+      my $apaUsageFN     = ">" . $apaUsageDIR . $currSample . ".APA.CSIusage";
+      my $noncontigAPAFN = ">" . $apaCSIDIR . $currSample . ".APA.noncontiguousCSIs";
+      open(CSIUSAGE, $csiUsageFN) || die("Cannot open $csiUsageFN for reading");
+      open(APAUSAGE, $apaUsageFN) || die("Cannot open $apaUsageFN for writing");
+      open(NONCONTIGUOUS, $noncontigAPAFN) || die("Cannot open $noncontigAPAFN for writing");
+ 
+      print APAUSAGE "chr\tstart\tend\tID\tscore(unused)\tstrand\tnumReads\tbasesCovered\t";
+      print APAUSAGE "CSILength\tpercentCovered\tusage\tnormUsage\tgeneID\tgeneSymbol\tinternalNormUsage\n";
+
+      print NONCONTIGUOUS "chr\tstart\tend\tID\tscore(unused)\tstrand\tnumReads\tbasesCovered\t";
+      print NONCONTIGUOUS "CSILength\tpercentCovered\tusage\tnormUsage\tgeneID\tgeneSymbol\n";
+
+      ############################################
+      ## Now get the stop locations of all CSIs ##
+      ## in order to normalize contiguous CSIs  ##
+      ############################################
+      my $header2 = <CSIUSAGE>;
+      while(my $line = <CSIUSAGE>){
+         chomp $line;
+         my($stopID, $usage) = getStopID($line);
+         if(defined $contigUse{$stopID}){
+            my $contigUsage = $contigUse{$stopID};
+            my $internalNormUsage;
+            if($contigUsage > 0){
+               $internalNormUsage = ($usage/$contigUsage);
+            }
+            else {
+               $internalNormUsage = 0;
+            }
+            print APAUSAGE "$line\t$internalNormUsage\n";
+         }
+         else {
+            print NONCONTIGUOUS "$line\n";
+         }
+      }
+      close(CSIUSAGE);
+      close(APAUSAGE);
+      close(NONCONTIGUOUS);
+   }
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub getPositionHASH {
+   my($oDir) = @_;
+
+   ########################################################################
+   ## Reads in from the contiguousCSIs file and produces a               ##
+   ## hash where the key is the CSI identifier and the                   ##
+   ## value is the position (from 3' UTR)                                ##
+   ##--------------------------------------------------------------------##
+   ## INPUT : $oDir   Output directory (where contiguousCSIs is located) ##
+   ## OUTPUT: $posHASH hash table as described above                     ##
+   ########################################################################
+
+   my $pFN = $oDir . "/contiguousCSIs";
+   open(POSITION, $pFN) || die("error in getPositionHASH: cannot open $pFN for reading");
+
+   my $headerPos = <POSITION>;
+   my %posHASH;
+
+   while (my $line = <POSITION>){
+      chomp $line;
+      my @clms = split(/\t/, $line);
+      my $csiID = $clms[3];
+      my $position = $clms[8];
+      $posHASH{$csiID} = $position;
+   }
+   close(POSITION);
+   return(%posHASH);
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub getContiguousDirectories {
+   my ($oDir) = @_;
+
+   ######################################################################
+   ## Returns three strings: the bed file name, output directory, and  ##
+   ## alternative polyadenylation directory for the contiguous 3' UTRs ##
+   ##------------------------------------------------------------------##
+   ## INPUT:  $oDir (output directory name)                            ##
+   ## OUTPUT: @retArr (array containing bed file name, and two output  ##
+   ##                  directory names)                                ##
+   ######################################################################
+
+   my $bedFN2  = $oDir . "/ExpressedContiguous/expressed.contiguous3UTRs.BED";
+   my $outDIR2 = $oDir . "/ExpressedContiguous/";
+   my $outDIR3 = $oDir . "/ExpressedContiguous/APA/";
+   my @retArr = ($bedFN2, $outDIR2, $outDIR3);
+   return(@retArr);
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub createReplicateAPAData {
+   my($dTableREF, $pHashREF, $aHashREF, $oDir) = @_;
+ 
+   ###############################################################################
+   ## Populate array with collated replicate data and mean values. Each line of ##
+   ## this array contains:                                                      ## 
+   ##    Condtion                                                               ## 
+   ##    CSI ID                                                                 ##
+   ##    -annotation information-                                               ##
+   ##    position in UTR                                                        ##
+   ##    -data-                                                                 ## 
+   ##    meanData                                                               ##
+   ##---------------------------------------------------------------------------##
+   ## INPUT:  $dTableREF (Reference to data table array)                        ##
+   ##         $pHashREF  (Reference to position hash)                           ##
+   ##         $aHashREF  (Reference to annotation hash)                         ##
+   ##         $oDir      (Output directory                                      ## 
+   ## OUTPUT: None                                                              ##
+   ###############################################################################
+
+   my %dataTable = %$dTableREF;
+   my %positionHASH = %$pHashREF;
+   my %annotationHASH = %$aHashREF;
+
+   my @dataArray;
+   foreach my $csiPerCondition (sort keys %dataTable){
+      my @info = split(/\t/, $csiPerCondition);
+      my $condition = $info[0];
+      my $csi = $info[1];
+      my $annotation = $annotationHASH{$csi};
+      my $position;
+      if(defined($positionHASH{$csi})){
+         $position = $positionHASH{$csi};
+      }
+      else {
+         $position = "nonContiguous";
+      }
+      my $dataLine = "$condition\t$annotation\t$position\t";
+
+      my $currDataLine = $dataTable{$csiPerCondition};
+      my @wds = split(/$SEPARATOR/, $currDataLine);
+      my $numReplicates = @wds;
+      my $normUsageTotal = 0;
+
+      for(my $i = 0; $i < $numReplicates; $i++) { 
+         my $normUsage = $wds[$i];
+         $dataLine .= "$normUsage\t";
+         $normUsageTotal += $normUsage;
+      }
+
+      my $meanNormUsage = ($normUsageTotal/$numReplicates);
+      $dataLine .= $meanNormUsage;
+      push (@dataArray, $dataLine);
+   }
+
+   #print to file
+   my $outFN = ">" . $oDir . "replicateDataCollated.APA.txt";
+   open(OUT, $outFN) || die("Error: Cannot open $outFN for writing");
+   foreach my $line (@dataArray){
+      print OUT "$line\n";
+   }
+   close(OUT);
+}
+#-----------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
+sub checkExternalExecutables {
+   my $numErrors = 0;
+   if(defined(which('coverageBed'))) { 
+      print "coverageBed found...ok\n";
+   }
+   else { 
+      print "CSI-UTR requires coverageBed from bedtools.  Please download and install bedtools \n";
+      print "from: https://github.com/arq5x/bedtools2/releases\n";
+      $numErrors++;
+   }
+   if($numErrors > 0) { 
+      exit(0);
+   }
+}
+#-----------------------------------------------------------------------------------
+
+###################################################################################
+################################ BEGINNING OF MAIN ################################
+###################################################################################
+checkExternalExecutables();
+GetOptions("genome=s" => \$GENOME, "r=i" => \$READ_LEN, "sample_info=s" => \$SAMPLE_INFO_FN, 
+           "bed=s" => \$ORG_BED_FN, "annot=s" => \$ORG_ANNOT_FN, "-out=s" =>\$OUT_DIR, 
+           "-data_dir=s" =>\$DATA_DIR, "-coverage_cut=f" => \$COVERAGE_CUT, 
+           "-usage_cut=f" => \$USAGE_CUT, "-p=f" => \$PVAL_CUTOFF, "-q=f" => \$FDR_CUTOFF );
+
+checkOptions($GENOME, $READ_LEN, $DATA_DIR, $OUT_DIR);
+$OVERHANG = $READ_LEN - 1;
+my $annotFN           = checkAnnotFile($GENOME);
+my $bedFN             = checkBedFile($GENOME);
+my @samArr            = checkSampleFile($DATA_DIR, $SAMPLE_INFO_FN);
+my @samNames          = getSampleArrInformation(\@samArr, 0);
+my @samConds          = getSampleArrInformation(\@samArr, 1);
+my @samReps           = getSampleArrInformation(\@samArr, 2);
+my %condHASH          = createGroupHash(\@samNames, \@samConds);
+my %annotationHASH         = getIDandSymbolAnnotations($ORG_ANNOT_FN);
+my %annotationCompleteHASH = getCompleteAnnotations($ORG_ANNOT_FN);
+my %annotationAltHASH      = getAlternateAnnotations($ORG_ANNOT_FN);
+my ($ContiguousBEDFN, $contiguousOUTDIR, $contiguousAPADIR) = getContiguousDirectories($OUT_DIR);
+
+###########################################
+## PERFORM MAIN CALCULATIONS ON ALL DATA ##
+###########################################
+getCoverageBed(\@samNames, $bedFN, $DATA_DIR, $OUT_DIR);
+createDEXSeqFiles(\@samNames, $DATA_DIR, $OUT_DIR);
+my @sizeFactors = estimateSizeFactors($OUT_DIR, \@samNames, \@samConds,
+                                      \@samReps, $READ_LEN, $OVERHANG);
+
+my @normSamArr = calculateNormalizedTrackingValues($OUT_DIR, \@samNames, \@samConds, 
+                                                    \@samReps, $READ_LEN, $OVERHANG, \@sizeFactors);
+
+createNormalizedFiles($OUT_DIR, \@normSamArr, \%annotationHASH, $READ_LEN, $OVERHANG);
+
+my %dataTableHASH = createDataTableHash(\%condHASH, $OUT_DIR, "", 11);
+printReplicateData(\%dataTableHASH, \%annotationHASH, $OUT_DIR);
+withinUTRComparisons(\%condHASH, \%dataTableHASH, \%annotationHASH, $OUT_DIR, 
+                     $PVAL_CUTOFF, $FDR_CUTOFF);
+pairwiseComparisons(\%condHASH, \%dataTableHASH, \%annotationHASH, $OUT_DIR,
+                     $PVAL_CUTOFF, $FDR_CUTOFF);
+pairwiseDEXSeqComparisons(\%annotationHASH, \%condHASH, $OUT_DIR, $PVAL_CUTOFF, $FDR_CUTOFF);
+
+printExpressionMatrix(\%condHASH, \%dataTableHASH, \%annotationHASH, $OUT_DIR);
+
+#############################################
+## NOW RERUN, BUT ONLY FOR CONTIGUOUS CSIS ##
+#############################################
+my @uniqueExpressedCSIs = getCutoffCSIs($OUT_DIR, \@samNames, $COVERAGE_CUT, $USAGE_CUT);
+filterNonContiguousCSIs(\@uniqueExpressedCSIs, $OUT_DIR, \%annotationHASH, \%annotationAltHASH, \%annotationCompleteHASH);
+getCoverageBed(\@samNames, $ContiguousBEDFN, $DATA_DIR, $contiguousOUTDIR);
+my @normContiguousSamArr = calculateNormalizedTrackingValues($contiguousOUTDIR, \@samNames, \@samConds, 
+                                                             \@samReps, $READ_LEN, $OVERHANG, \@sizeFactors);
+createNormalizedFiles($contiguousOUTDIR, \@normContiguousSamArr, \%annotationHASH, $READ_LEN, $OVERHANG);
+calculateInternal3utrusage_APA($OUT_DIR, \@samNames);
+my %positionHASH = getPositionHASH($contiguousOUTDIR);
+my %APAdataTableHASH = createDataTableHash(\%condHASH, $contiguousAPADIR, ".APA", 14);
+createReplicateAPAData (\%APAdataTableHASH, \%positionHASH, \%annotationHASH, $contiguousAPADIR);
+
+################################################################################
+################################ END OF PROGRAM ################################
+################################################################################
+
+
+=head1 NAME
+
+ CSI-UTR_v1.1.0
+
+
+=head1 USAGE
+
+__________________________________________________________________________________
+__________________________________________________________________________________
+
+CSI-UTR <options>
+
+__________________________________________________________________________________
+   options: 
+      -genome=<genome>                    (default: Rn6)
+      -r=<read_length>                    (default: 75)
+      -sample_info=<sample_info_table_fn> (default: sampleInformaton.txt) 
+      -bed=<CSI_bed_file>                 (default: ./data/locations/Rn6.CSIs.bed)
+      -annot=<CSI_annotation_file>        (default: ./data/annotations/Rn6.annot.bed)
+      -out=<output directory>             (default: ./CSI_OUT/) 
+      -data_dir=<input directory>         (default: ./) 
+      -coverage_cut=<coverage cutoff>     (default: 0.08) 
+      -usage_cut=<usage cutoff>           (default: 1.0)
+      -p=<p value significance cutoff)    (default: 0.05)
+      -q=<FDR significance cutoff)        (default: 0.10)
+
+      --h Print this help screen
+      --v Print version information
+__________________________________________________________________________________
+__________________________________________________________________________________
+
+CSI_annotation_file is a tab-delimited file containing the following columns:
+   column 1: sample indentifier
+   column 2: sample description
+   column 3: replicate number
+
+The bed file and annotation file can be downloaded for a specific organism at the 
+project website: http://bioinformatics.louisville.edu/CSI-UTR/ 
+
+=head1 DESCRIPTION
+
+ CSI-UTR is an approach for using cleavage stie intervals (CSIs) determined using poly-adenylation sequencing for the
+ purpose of detecting differential expression within 3' untranslated regions of genes.
+
+=head1 BUGS or CAVEATS
+
+ Normalization of cleavage site intervals currently does not take into account mapped reads, but rather the overall coverage
+ within CSIs.  Each sample is normalized using the DESeq2 method.
+
+=head1 TODO
+
+Need to change coveragebed search to search mapable length:
+_______|||||||||||||||  <- for positive strand
+|||||||||||||||_______  <- for negative strand
+(___ = overhang)
+
+        - Do this for each individual CSI and then for the total contiguous 3'UTR.
+ 
+=head1 ACKNOWLEDGEMENTS
+
+Please Cite: Harrison BJ, Park JW, Gomes C, Petruska JC, Sapio MR, Iadarola MJ, 
+             Rouchka EC. (2017) Detection of significantly differentially       
+             expressed cleavage site intervals within 3' untranslated regions   
+             using CSI-UTR.  Under review.                                      
+
+=head1 COPYRIGHT
+
+ Copyright (C) 2015-2017, University of Louisville.  All rights reserved.
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+
+=head1 AVAILABILITY
+
+ http://bioinformatics.louisville.edu/CSI-UTR/
+
+=head1 AUTHORS
+
+ Benjamin J. Harrison (1,2)
+ Eric C. Rouchka (2,3)
+
+ (1) Department of Anatomical Sciences and Neurobiology
+ (2) Kentucky Biomedical Research Infrastructure Network (KBRIN)
+ (3) Department of Computer Engineering and Computer Science
+ 522 East Gray Street
+ University of Louisville, Louisville, Kentucky USA 40292
+
+=head1 SEE ALSO
+
+=cut
+
+

@@ -1,0 +1,88 @@
+#!/bin/bash
+NUM_ERRORS=0
+ERROR_STRING="ERRORS ENCOUNTERED:\n"
+
+if command -v coverageBed  > /dev/null 2>&1; then
+   BED_VERSION="$(bedtools --version)"
+   MIN_BED_MAJOR_VERSION=2
+   MIN_BED_MINOR_VERSION=24
+   echo $BED_VERSION
+   BED_MAJOR_VERSION=$(bedtools --version 2>&1 | grep -Po '(?<=v)\d+')
+   BED_MINOR_VERSION=$(bedtools --version 2>&1 | grep -Po '(?<=v\d.)\d+')
+   echo coverageBed is installed
+   which coverageBed
+   if test $BED_MAJOR_VERSION -ge $MIN_BED_MAJOR_VERSION; then
+      if test $BED_MINOR_VERSION -ge $MIN_BED_MINOR_VERSION; then
+         echo bedtools version $BED_VERSION OK
+      else
+         NUM_ERRORS=$((NUM_ERRORS+1))
+         ERROR_STRING=("$ERROR_STRING   INCORRECT BEDTOOLS VERSION\n")
+         echo ===ERROR=== bedtools version 2.24.0 or greater must be installed from https://github.com/arq5x/bedtools2
+      fi
+   else
+      echo ===ERROR=== bedtools version 2.24.0 or greater must be installed from https://github.com/arq5x/bedtools2
+      NUM_ERRORS=$((NUM_ERRORS+1))
+      ERROR_STRING=("$ERROR_STRING   INCORRECT BEDTOOLS VERSION\n")
+   fi
+else
+   echo ===ERROR=== Please install coverageBed from BedTools: https://github.com/arq5x/bedtool2
+   NUM_ERRORS=$((NUM_ERRORS+1))
+   ERROR_STRING=("$ERROR_STRING   BEDTOOLS NOT INSTALLED\n")
+fi
+echo
+if command -v R  > /dev/null 2>&1; then
+
+   echo R is installed
+   which R
+   echo DESeq2 and DEXSeq libraries will be installed if missing
+else
+   echo ===ERROR=== please install R before using CSI-UTR
+   echo             also install packages DESeq2 and DEXSeq
+   NUM_ERRORS=$((NUM_ERRORS+1))
+   ERROR_STRING=("$ERROR_STRING   R NOT INSTALLED\n")
+fi
+echo
+if command -v samtools  > /dev/null 2>&1; then
+   SAMVERSION=$(samtools --version)
+   echo samtools is installed
+   which samtools 
+   echo $SAMVERSION
+else
+   echo ===ERROR=== please install samtools before using CSI-UTR
+   NUM_ERRORS=$((NUM_ERRORS+1))
+   ERROR_STRING=("$ERROR_STRING   samtools NOT INSTALLED\n")
+fi
+echo
+if perl < /dev/null > /dev/null 2>&1; then
+   echo perl is installed
+   which perl
+   echo
+   echo Checking perl modules
+   perl checkModules.pl
+   PERLERROR=$?
+   if test $PERLERROR -gt 0; then
+      echo ===ERROR=== $PERLERROR modules missing or out-of-date
+      NUM_ERRORS=$((NUM_ERRORS+1))
+      ERROR_STRING=("$ERROR_STRING   $PERLERROR perl modules missing or out-of-date\n")
+   fi
+
+else
+   echo ===ERROR=== please install perl before using CSI-UTR
+   NUM_ERRORS=$((NUM_ERRORS+1))
+   ERROR_STRING=("$ERROR_STRING   PERL NOT INSTALLED\n")
+fi
+echo
+
+if test $NUM_ERRORS -gt 0; then
+   echo "================================================="
+   echo
+   echo -e $NUM_ERRORS $ERROR_STRING
+   echo "================================================="
+else
+   echo "==========================="
+   echo "== NO ERRORS ENCOUNTERED =="
+   echo "==                       =="
+   echo "== Please see README on  =="
+   echo "== how to run CSI-UTR    =="
+   echo "==========================="
+fi

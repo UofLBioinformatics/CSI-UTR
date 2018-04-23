@@ -1,0 +1,6 @@
+SRR1174021	Sham	1
+SRR1174022	Sham	2
+SRR1174023	Sham	3
+SRR1174024	Optic_nerve_crush	1
+SRR1174025	Optic_nerve_crush	2
+SRR1174026	Optic_nerve_crush	3
